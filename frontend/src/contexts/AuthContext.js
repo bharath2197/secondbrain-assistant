@@ -1,7 +1,25 @@
 import { createContext, useContext, useState, useEffect } from 'react';
 import { supabase } from '@/lib/supabase';
 
+const SUPABASE_URL = process.env.REACT_APP_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY;
+
 const AuthContext = createContext({});
+
+async function authFetch(endpoint, body) {
+  const res = await fetch(`${SUPABASE_URL}/auth/v1${endpoint}`, {
+    method: 'POST',
+    headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const raw = await res.text();
+  let data = null;
+  try { data = raw ? JSON.parse(raw) : null; } catch { /* not json */ }
+  if (!res.ok) {
+    throw new Error(data?.error_description || data?.msg || data?.error || raw || res.statusText);
+  }
+  return data;
+}
 
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null);
@@ -21,14 +39,26 @@ export function AuthProvider({ children }) {
   }, []);
 
   const signUp = async (email, password) => {
-    const { data, error } = await supabase.auth.signUp({ email, password });
-    if (error) throw error;
+    const data = await authFetch('/signup', { email, password });
+    if (data?.access_token) {
+      const { error } = await supabase.auth.setSession({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+      });
+      if (error) throw error;
+    }
     return data;
   };
 
   const signIn = async (email, password) => {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-    if (error) throw error;
+    const data = await authFetch('/token?grant_type=password', { email, password });
+    if (data?.access_token) {
+      const { error } = await supabase.auth.setSession({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+      });
+      if (error) throw error;
+    }
     return data;
   };
 
