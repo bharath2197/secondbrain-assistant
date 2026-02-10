@@ -1,0 +1,143 @@
+{
+  "identity": {
+    "name": "E1",
+    "persona": "Anti-AI Designer",
+    "mission": "Create a 'Soft Utility' personal assistant that feels like a calm, intelligent companion, not a cold tool.",
+    "vibe": "Clean, Friendly, Focused, Tactile"
+  },
+  "brand": {
+    "app_name": "SecondBrain",
+    "primary_color": "#18181B",
+    "accent_color": "#6366F1",
+    "background_color_light": "#FAFAFA",
+    "background_color_dark": "#09090B",
+    "font_heading": "Manrope",
+    "font_body": "Inter",
+    "radius_default": "1rem"
+  },
+  "typography": {
+    "h1": "font-heading font-bold text-3xl tracking-tight",
+    "h2": "font-heading font-semibold text-2xl tracking-tight",
+    "h3": "font-heading font-semibold text-xl",
+    "body": "font-body text-base leading-relaxed text-zinc-600 dark:text-zinc-400",
+    "label": "font-body text-xs font-medium uppercase tracking-wider text-zinc-500",
+    "button": "font-body font-medium text-sm tracking-wide"
+  },
+  "colors": {
+    "light": {
+      "background": "#FAFAFA",
+      "surface": "#FFFFFF",
+      "primary": "#18181B",
+      "primary_foreground": "#FFFFFF",
+      "secondary": "#F4F4F5",
+      "secondary_foreground": "#18181B",
+      "accent": "#EEF2FF",
+      "accent_foreground": "#4338CA",
+      "border": "#E4E4E7",
+      "muted": "#F4F4F5",
+      "destructive": "#EF4444"
+    },
+    "dark": {
+      "background": "#09090B",
+      "surface": "#18181B",
+      "primary": "#FAFAFA",
+      "primary_foreground": "#18181B",
+      "secondary": "#27272A",
+      "secondary_foreground": "#FAFAFA",
+      "accent": "#312E81",
+      "accent_foreground": "#E0E7FF",
+      "border": "#27272A",
+      "muted": "#27272A",
+      "destructive": "#7F1D1D"
+    }
+  },
+  "layout_strategies": {
+    "mobile_first": true,
+    "bottom_navigation": {
+      "height": "h-16",
+      "position": "fixed bottom-0 left-0 right-0",
+      "style": "bg-background/80 backdrop-blur-lg border-t border-border z-50 pb-safe",
+      "items_count": 4
+    },
+    "safe_areas": "pt-safe pb-24 px-4 md:px-6 max-w-md mx-auto h-full",
+    "containers": "w-full max-w-md mx-auto min-h-screen bg-background relative overflow-hidden shadow-2xl shadow-zinc-200 dark:shadow-black"
+  },
+  "components": {
+    "buttons": {
+      "primary": "rounded-full bg-primary text-primary-foreground hover:opacity-90 transition-transform active:scale-95 shadow-sm px-6 py-3",
+      "secondary": "rounded-full bg-secondary text-secondary-foreground hover:bg-secondary/80 transition-colors px-6 py-3",
+      "ghost": "rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 transition-colors p-2",
+      "fab": "rounded-full bg-primary text-primary-foreground shadow-lg hover:shadow-xl transition-all active:scale-90 p-4 fixed bottom-20 right-4 z-40"
+    },
+    "inputs": {
+      "chat": "bg-secondary/50 border-0 focus-visible:ring-1 focus-visible:ring-primary rounded-3xl py-3 px-5 shadow-inner placeholder:text-muted-foreground/70",
+      "search": "bg-background border border-border rounded-xl px-4 py-2 focus:ring-1 focus:ring-primary"
+    },
+    "cards": {
+      "base": "bg-surface rounded-2xl border border-border/50 shadow-sm p-5 hover:shadow-md transition-shadow",
+      "flat": "bg-secondary/30 rounded-xl border border-transparent p-4"
+    },
+    "chat_bubbles": {
+      "user": "bg-primary text-primary-foreground rounded-2xl rounded-tr-sm px-5 py-3 max-w-[85%] self-end shadow-sm",
+      "ai": "bg-surface border border-border text-foreground rounded-2xl rounded-tl-sm px-5 py-3 max-w-[85%] self-start shadow-sm"
+    },
+    "status_indicators": {
+      "recording": "animate-pulse bg-red-500 text-white rounded-full p-4 shadow-lg ring-4 ring-red-100 dark:ring-red-900/30",
+      "processing": "animate-spin text-zinc-400"
+    }
+  },
+  "motion": {
+    "transitions": "transition-all duration-300 ease-[cubic-bezier(0.25,0.1,0.25,1)]",
+    "page_transition": {
+      "initial": { "opacity": 0, "y": 10 },
+      "animate": { "opacity": 1, "y": 0 },
+      "exit": { "opacity": 0, "y": -10 }
+    },
+    "list_stagger": 0.05
+  },
+  "icons": {
+    "library": "lucide-react",
+    "style": "stroke-[1.5px]",
+    "mappings": {
+      "chat": "MessageSquare",
+      "knowledge": "Brain",
+      "reminders": "Bell",
+      "settings": "Settings",
+      "send": "Send",
+      "mic": "Mic",
+      "close": "X",
+      "menu": "Menu",
+      "search": "Search",
+      "check": "Check",
+      "plus": "Plus",
+      "trash": "Trash2",
+      "edit": "Edit2"
+    }
+  },
+  "instructions_to_main_agent": {
+    "setup": [
+      "Install dependencies: `npm install lucide-react framer-motion clsx tailwind-merge sonner`",
+      "Ensure `Manrope` and `Inter` fonts are imported in `index.css` via Google Fonts."
+    ],
+    "file_structure_rules": [
+      "Components MUST go in `/app/frontend/src/components/`",
+      "Pages MUST go in `/app/frontend/src/pages/`",
+      "Layouts MUST go in `/app/frontend/src/layouts/`"
+    ],
+    "implementation_notes": [
+      "Use `framer-motion` for all page transitions and list entry animations.",
+      "Implement the Bottom Navigation as a Layout wrapper that persists across routes.",
+      "Ensure the Chat Input stays fixed above the Bottom Nav, pushing content up.",
+      "Use `sonner` for all success/error toasts.",
+      "The 'Voice Mode' should trigger a distinct UI state (e.g., a bottom sheet or overlay) to indicate active listening.",
+      "Respect `prefers-color-scheme` but allow manual override in Settings."
+    ]
+  },
+  "universal_guidelines": [
+    "Do not use gradients for backgrounds. Use solid, calm colors.",
+    "Use 24px-32px padding for main content areas.",
+    "Ensure touch targets are at least 44x44px.",
+    "Avoid 'Alert' dialogs for simple confirmations; use non-blocking Toasts or inline feedback.",
+    "Never use generic 'Lorem Ipsum'. Use realistic placeholder data related to productivity (e.g., 'Buy milk', 'Meeting with Sarah')."
+  ]
+}
