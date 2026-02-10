@@ -6,19 +6,35 @@ const SUPABASE_ANON_KEY = process.env.REACT_APP_SUPABASE_ANON_KEY;
 
 const AuthContext = createContext({});
 
-async function authFetch(endpoint, body) {
-  const res = await fetch(`${SUPABASE_URL}/auth/v1${endpoint}`, {
-    method: 'POST',
-    headers: { 'apikey': SUPABASE_ANON_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  const raw = await res.text();
+// XHR-based auth request — bypasses any window.fetch interceptor that
+// consumes the response body (analytics scripts, Supabase GoTrue, etc.).
+function parseResponse(status, responseText) {
+  const ok = status >= 200 && status < 300;
+  const raw = responseText || '';
   let data = null;
   try { data = raw ? JSON.parse(raw) : null; } catch { /* not json */ }
-  if (!res.ok) {
-    throw new Error(data?.error_description || data?.msg || data?.error || raw || res.statusText);
-  }
-  return data;
+  return { ok, status, raw, data };
+}
+
+function authFetch(endpoint, body) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${SUPABASE_URL}/auth/v1${endpoint}`);
+    xhr.setRequestHeader('apikey', SUPABASE_ANON_KEY);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onload = function () {
+      const { ok, raw, data } = parseResponse(xhr.status, xhr.responseText);
+      if (!ok) {
+        reject(new Error(data?.error_description || data?.msg || data?.error || raw || 'Request failed'));
+      } else {
+        resolve(data);
+      }
+    };
+    xhr.onerror = function () {
+      reject(new Error('Network error'));
+    };
+    xhr.send(JSON.stringify(body));
+  });
 }
 
 export function AuthProvider({ children }) {
