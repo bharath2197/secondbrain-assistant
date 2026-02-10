@@ -31,9 +31,8 @@ export default function AuthPage() {
     try {
       if (action === 'signup') {
         const data = await signUp(email, password);
-        if (data.session) {
+        if (data?.access_token) {
           toast.success('Account created!');
-          navigate('/');
         } else {
           toast.success('Account created! Check your email to confirm, then log in.');
         }
