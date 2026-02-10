@@ -1,74 +1,374 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request, HTTPException
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
-from pathlib import Path
-from pydantic import BaseModel, Field, ConfigDict
-from typing import List
+import json
 import uuid
+import re
+import httpx
+import jwt
+from pathlib import Path
+from pydantic import BaseModel
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
-
+from zoneinfo import ZoneInfo
+from emergentintegrations.llm.chat import LlmChat, UserMessage
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY')
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
 
-# Create the main app without a prefix
 app = FastAPI()
-
-# Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Define Models
-class StatusCheck(BaseModel):
-    model_config = ConfigDict(extra="ignore")  # Ignore MongoDB's _id field
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+# ---- Supabase REST helpers ----
+class SupabaseREST:
+    def __init__(self, token: str):
+        self.base = f"{SUPABASE_URL}/rest/v1"
+        self.headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
 
-# Add your routes to the router instead of directly to app
+    async def select(self, table: str, params: dict = None) -> list:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(f"{self.base}/{table}", headers=self.headers, params=params or {})
+            if r.status_code >= 400:
+                logger.error(f"Supabase SELECT {table}: {r.status_code} {r.text}")
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+            return r.json()
+
+    async def insert(self, table: str, data: dict) -> list:
+        h = {**self.headers, "Prefer": "return=representation"}
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{self.base}/{table}", headers=h, json=data)
+            if r.status_code >= 400:
+                logger.error(f"Supabase INSERT {table}: {r.status_code} {r.text}")
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+            return r.json()
+
+    async def upsert(self, table: str, data: dict, on_conflict: str = "id") -> list:
+        h = {**self.headers, "Prefer": "return=representation,resolution=merge-duplicates"}
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.post(f"{self.base}/{table}?on_conflict={on_conflict}", headers=h, json=data)
+            if r.status_code >= 400:
+                logger.error(f"Supabase UPSERT {table}: {r.status_code} {r.text}")
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+            return r.json()
+
+    async def update(self, table: str, data: dict, match: dict) -> list:
+        h = {**self.headers, "Prefer": "return=representation"}
+        params = {k: f"eq.{v}" for k, v in match.items()}
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.patch(f"{self.base}/{table}", headers=h, json=data, params=params)
+            if r.status_code >= 400:
+                logger.error(f"Supabase UPDATE {table}: {r.status_code} {r.text}")
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+            return r.json()
+
+    async def delete(self, table: str, match: dict) -> None:
+        params = {k: f"eq.{v}" for k, v in match.items()}
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.delete(f"{self.base}/{table}", headers=self.headers, params=params)
+            if r.status_code >= 400:
+                logger.error(f"Supabase DELETE {table}: {r.status_code} {r.text}")
+                raise HTTPException(status_code=r.status_code, detail=r.text)
+
+
+# ---- Auth helpers ----
+def get_token(request: Request) -> str:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing auth token")
+    return auth[7:]
+
+
+def decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, options={"verify_signature": False})
+    except jwt.DecodeError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_user_id(request: Request) -> str:
+    payload = decode_token(get_token(request))
+    uid = payload.get("sub")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+    return uid
+
+
+def get_db(request: Request) -> SupabaseREST:
+    return SupabaseREST(get_token(request))
+
+
+# ---- Request models ----
+class ChatRequest(BaseModel):
+    message: str
+    pending_reminder: Optional[Dict[str, Any]] = None
+
+
+class ProfileUpdate(BaseModel):
+    timezone: str
+
+
+class ReminderStatusUpdate(BaseModel):
+    status: str
+
+
+# ---- LLM Extraction ----
+EXTRACTION_PROMPT = """You are SecondBrain, a personal assistant. Process the user's message and determine the appropriate action.
+
+Current date/time (user's local): {now}
+User's timezone: {timezone}
+
+RULES:
+1. If the message contains information to remember (a fact, note, contact info, order details, preferences), classify as "kb".
+2. If the message mentions a future action, deadline, follow-up, or contains date/time intent, classify as "reminder".
+3. If a reminder is being built (see PENDING STATE below) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
+4. For general conversation or greetings, classify as "chat".
+5. Required reminder fields: title, due_datetime_local. Only ask about these if truly missing.
+6. If the user provides a relative time like "tomorrow" or "next Monday at 3pm", compute the actual date from the current date/time.
+7. If no time is given for a reminder, default to 09:00.
+8. Once all required reminder fields are present, create the reminder immediately. Do NOT ask more questions.
+
+PENDING REMINDER STATE: {pending_reminder}
+If there is a pending reminder, try to fill missing fields from the current message.
+
+RETURN ONLY VALID JSON (no markdown, no code fences):
+{{
+  "type": "kb" | "reminder" | "clarify" | "chat",
+  "kb_entry": {{
+    "entity_type": "note" | "contact" | "order" | "fact",
+    "entity_name": "string or null",
+    "order_ref": "string or null",
+    "details": "the key information extracted"
+  }} or null,
+  "reminder": {{
+    "title": "short descriptive title",
+    "due_datetime_local": "YYYY-MM-DDTHH:MM:SS",
+    "order_ref": "string or null",
+    "related_party": "string or null"
+  }} or null,
+  "clarify_question": "string or null",
+  "updated_pending": {{
+    "title": "string or null",
+    "due_datetime_local": "string or null",
+    "order_ref": "string or null",
+    "related_party": "string or null"
+  }} or null,
+  "response": "friendly natural language response confirming what you did"
+}}"""
+
+
+async def extract_message(message: str, user_tz: str, pending: dict = None, recent: list = None) -> dict:
+    now_str = datetime.now(ZoneInfo(user_tz)).strftime("%Y-%m-%d %H:%M:%S %A")
+    system_msg = EXTRACTION_PROMPT.format(
+        now=now_str,
+        timezone=user_tz,
+        pending_reminder=json.dumps(pending) if pending else "None"
+    )
+
+    chat = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"extract-{uuid.uuid4()}",
+        system_message=system_msg
+    ).with_model("openai", "gpt-4o")
+
+    parts = []
+    if recent:
+        parts.append("Recent conversation:")
+        for m in recent[-6:]:
+            parts.append(f"  {m['role']}: {m['content']}")
+        parts.append("")
+    parts.append(f"User says: {message}")
+
+    response = await chat.send_message(UserMessage(text="\n".join(parts)))
+
+    try:
+        return json.loads(response)
+    except json.JSONDecodeError:
+        m = re.search(r'\{[\s\S]*\}', response)
+        if m:
+            try:
+                return json.loads(m.group())
+            except json.JSONDecodeError:
+                pass
+        return {
+            "type": "chat",
+            "kb_entry": None,
+            "reminder": None,
+            "clarify_question": None,
+            "updated_pending": None,
+            "response": response
+        }
+
+
+def local_to_utc(local_dt_str: str, tz_str: str) -> str:
+    local_dt = datetime.fromisoformat(local_dt_str)
+    if local_dt.tzinfo is None:
+        local_dt = local_dt.replace(tzinfo=ZoneInfo(tz_str))
+    return local_dt.astimezone(ZoneInfo('UTC')).isoformat()
+
+
+# ---- API Endpoints ----
 @api_router.get("/")
 async def root():
-    return {"message": "Hello World"}
+    return {"status": "ok", "service": "SecondBrain API"}
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.model_dump()
-    status_obj = StatusCheck(**status_dict)
-    
-    # Convert to dict and serialize datetime to ISO string for MongoDB
-    doc = status_obj.model_dump()
-    doc['timestamp'] = doc['timestamp'].isoformat()
-    
-    _ = await db.status_checks.insert_one(doc)
-    return status_obj
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    # Exclude MongoDB's _id field from the query results
-    status_checks = await db.status_checks.find({}, {"_id": 0}).to_list(1000)
-    
-    # Convert ISO string timestamps back to datetime objects
-    for check in status_checks:
-        if isinstance(check['timestamp'], str):
-            check['timestamp'] = datetime.fromisoformat(check['timestamp'])
-    
-    return status_checks
+@api_router.get("/profile")
+async def get_profile(request: Request):
+    db = get_db(request)
+    uid = get_user_id(request)
+    rows = await db.select("user_profile", {"id": f"eq.{uid}"})
+    return rows[0] if rows else None
 
-# Include the router in the main app
+
+@api_router.post("/profile")
+async def upsert_profile(body: ProfileUpdate, request: Request):
+    db = get_db(request)
+    uid = get_user_id(request)
+    email = decode_token(get_token(request)).get("email", "")
+    data = {"id": uid, "user_email": email, "timezone": body.timezone}
+    result = await db.upsert("user_profile", data, on_conflict="id")
+    return result[0] if result else data
+
+
+@api_router.post("/chat")
+async def chat_endpoint(body: ChatRequest, request: Request):
+    db = get_db(request)
+    uid = get_user_id(request)
+
+    # Get timezone
+    profiles = await db.select("user_profile", {"id": f"eq.{uid}"})
+    user_tz = profiles[0]["timezone"] if profiles else "UTC"
+
+    # Recent messages for context
+    recent = await db.select("chat_messages", {
+        "user_id": f"eq.{uid}",
+        "order": "created_at.desc",
+        "limit": "10"
+    })
+    recent.reverse()
+
+    # Save user message
+    await db.insert("chat_messages", {"user_id": uid, "role": "user", "content": body.message})
+
+    # LLM extraction
+    extraction = await extract_message(
+        body.message, user_tz, body.pending_reminder,
+        [{"role": m["role"], "content": m["content"]} for m in recent]
+    )
+
+    result_type = extraction.get("type", "chat")
+    response_text = extraction.get("response", "Got it!")
+    saved_kb = None
+    saved_reminder = None
+
+    if result_type == "kb" and extraction.get("kb_entry"):
+        kb = extraction["kb_entry"]
+        entry = {
+            "user_id": uid,
+            "entity_type": kb.get("entity_type", "note"),
+            "entity_name": kb.get("entity_name"),
+            "order_ref": kb.get("order_ref"),
+            "details": kb.get("details", body.message),
+            "source_message": body.message,
+        }
+        rows = await db.insert("kb_entries", entry)
+        saved_kb = rows[0] if rows else entry
+
+    elif result_type == "reminder" and extraction.get("reminder"):
+        rem = extraction["reminder"]
+        due_local = rem.get("due_datetime_local", "")
+        due_utc = local_to_utc(due_local, user_tz) if due_local else None
+        rdata = {
+            "user_id": uid,
+            "title": rem.get("title", ""),
+            "due_datetime": due_utc,
+            "timezone": user_tz,
+            "related_order_ref": rem.get("order_ref"),
+            "related_party": rem.get("related_party"),
+            "status": "open",
+            "source_message": body.message,
+        }
+        rows = await db.insert("reminders", rdata)
+        saved_reminder = rows[0] if rows else rdata
+
+    # Save assistant message
+    await db.insert("chat_messages", {"user_id": uid, "role": "assistant", "content": response_text})
+
+    return {
+        "type": result_type,
+        "response": response_text,
+        "kb_entry": saved_kb,
+        "reminder": saved_reminder,
+        "clarify_question": extraction.get("clarify_question"),
+        "updated_pending": extraction.get("updated_pending"),
+    }
+
+
+@api_router.get("/messages")
+async def get_messages(request: Request, limit: int = 50):
+    db = get_db(request)
+    uid = get_user_id(request)
+    return await db.select("chat_messages", {
+        "user_id": f"eq.{uid}",
+        "order": "created_at.asc",
+        "limit": str(limit),
+    })
+
+
+@api_router.get("/kb")
+async def get_kb(request: Request, entity_type: str = None, search: str = None):
+    db = get_db(request)
+    uid = get_user_id(request)
+    params: dict = {"user_id": f"eq.{uid}", "order": "created_at.desc"}
+    if entity_type:
+        params["entity_type"] = f"eq.{entity_type}"
+    if search:
+        params["or"] = f"(details.ilike.%{search}%,entity_name.ilike.%{search}%,order_ref.ilike.%{search}%)"
+    return await db.select("kb_entries", params)
+
+
+@api_router.delete("/kb/{entry_id}")
+async def delete_kb(entry_id: str, request: Request):
+    db = get_db(request)
+    uid = get_user_id(request)
+    await db.delete("kb_entries", {"id": entry_id, "user_id": uid})
+    return {"ok": True}
+
+
+@api_router.get("/reminders")
+async def get_reminders(request: Request, status: str = None):
+    db = get_db(request)
+    uid = get_user_id(request)
+    params: dict = {"user_id": f"eq.{uid}", "order": "due_datetime.asc"}
+    if status:
+        params["status"] = f"eq.{status}"
+    return await db.select("reminders", params)
+
+
+@api_router.patch("/reminders/{reminder_id}")
+async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request: Request):
+    db = get_db(request)
+    uid = get_user_id(request)
+    result = await db.update("reminders", {"status": body.status}, {"id": reminder_id, "user_id": uid})
+    return result[0] if result else {"ok": True}
+
+
+# ---- Middleware & startup ----
 app.include_router(api_router)
-
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -76,14 +376,3 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
