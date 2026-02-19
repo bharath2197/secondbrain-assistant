@@ -94,36 +94,87 @@ export default function ChatPage() {
   };
 
   const toggleListening = () => {
-    if (!speechSupported) {
-      toast.error('Voice input not supported on this browser. Use typing.');
+    // Must detect support synchronously in the click handler
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      toast.error('Voice input not supported in this browser. Use typing.');
+      setSpeechSupported(false);
       return;
     }
-    if (listening) {
-      recognitionRef.current?.stop();
-      setListening(false);
-    } else {
-      startListening();
-    }
-  };
 
-  const startListening = () => {
+    // If already listening, stop
+    if (recognitionRef.current && listening) {
+      console.log('[SR] stopping');
+      recognitionRef.current.stop();
+      setListening(false);
+      return;
+    }
+
+    // Prevent double-start
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch { /* ok */ }
+      recognitionRef.current = null;
+    }
+
+    // Barge-in: cancel any ongoing TTS
     window.speechSynthesis?.cancel();
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    // Create and start recognition synchronously inside user gesture
     const recognition = new SR();
     recognition.continuous = false;
-    recognition.interimResults = false;
+    recognition.interimResults = true;
     recognition.lang = 'en-US';
 
-    recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript;
-      setInput(prev => prev ? prev + ' ' + transcript : transcript);
+    recognition.onstart = () => {
+      console.log('[SR] start');
+      setListening(true);
     };
-    recognition.onerror = () => setListening(false);
-    recognition.onend = () => setListening(false);
+
+    recognition.onresult = (event) => {
+      let finalTranscript = '';
+      let interimTranscript = '';
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          finalTranscript += t;
+        } else {
+          interimTranscript += t;
+        }
+      }
+      console.log('[SR] result:', finalTranscript || interimTranscript);
+      if (finalTranscript) {
+        setInput(prev => prev ? prev + ' ' + finalTranscript : finalTranscript);
+      }
+    };
+
+    recognition.onerror = (event) => {
+      console.error('[SR] error:', event.error);
+      setListening(false);
+      recognitionRef.current = null;
+      if (event.error === 'not-allowed' || event.error === 'permission-denied') {
+        toast.error('Microphone blocked. Enable mic permissions in browser site settings and refresh.');
+      } else if (event.error === 'no-speech') {
+        toast.info('No speech detected. Try again.');
+      } else if (event.error !== 'aborted') {
+        toast.error(`Voice error: ${event.error}`);
+      }
+    };
+
+    recognition.onend = () => {
+      console.log('[SR] end');
+      setListening(false);
+      recognitionRef.current = null;
+    };
 
     recognitionRef.current = recognition;
-    recognition.start();
-    setListening(true);
+    try {
+      recognition.start();
+    } catch (err) {
+      console.error('[SR] start failed:', err);
+      setListening(false);
+      recognitionRef.current = null;
+      toast.error('Failed to start voice input. Try again.');
+    }
   };
 
   const speak = (text) => {
