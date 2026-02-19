@@ -385,7 +385,7 @@ async def get_messages(request: Request, limit: int = 50):
 async def get_kb(request: Request, entity_type: str = None, search: str = None):
     db = get_db(request)
     uid = get_user_id(request)
-    params: dict = {"user_id": f"eq.{uid}", "order": "created_at.desc"}
+    params: dict = {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": "100"}
     if entity_type:
         params["entity_type"] = f"eq.{entity_type}"
     if search:
@@ -405,7 +405,7 @@ async def delete_kb(entry_id: str, request: Request):
 async def get_reminders(request: Request, status: str = None):
     db = get_db(request)
     uid = get_user_id(request)
-    params: dict = {"user_id": f"eq.{uid}", "order": "due_datetime.asc"}
+    params: dict = {"user_id": f"eq.{uid}", "order": "due_datetime.asc", "limit": "500"}
     if status:
         params["status"] = f"eq.{status}"
     return await db.select("reminders", params)
