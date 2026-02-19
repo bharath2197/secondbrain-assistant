@@ -284,6 +284,12 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     saved_kb = None
     saved_reminder = None
 
+    # Server-side fallback: if LLM returned "reminder" but also filled kb_entry, treat as "both"
+    if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
+        result_type = "both"
+    if result_type == "kb" and extraction.get("reminder") and extraction.get("kb_entry"):
+        result_type = "both"
+
     # Helper: save a KB entry
     async def _save_kb(kb_data):
         entry = {
