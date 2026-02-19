@@ -129,12 +129,12 @@ class ReminderStatusUpdate(BaseModel):
 EXTRACTION_PROMPT = """You are SecondBrain, a personal assistant. Process the user's message and determine the appropriate action.
 
 Current date/time (user's local): {now}
-User's timezone: {timezone}
+User's default timezone: {timezone}
 
 RULES:
 1. If the message contains ONLY factual information (a fact, note, contact info, order details, preferences) with NO date/time/follow-up intent, classify as "kb".
 2. If the message mentions ONLY a future action, deadline, or follow-up with date/time intent, classify as "reminder".
-3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, classify as "both". Fill BOTH kb_entry and reminder fields.
+3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, you MUST classify as "both" and fill BOTH kb_entry AND reminder. Examples of mixed input: "PO 600 shipment delayed due to weather. Follow up Friday at 2 PM." — the factual update is kb_entry, the follow-up is a reminder.
 4. If a reminder is being built (see PENDING STATE) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
 5. For general conversation or greetings, classify as "chat".
 
@@ -144,6 +144,10 @@ REMINDER RULES:
 - If no time is given for a reminder, default to 09:00.
 - Once due_datetime_local is present, create the reminder immediately. Do NOT ask more questions.
 - Extract order_ref/reference numbers (PO, INV, CASE, etc.) when present and attach to BOTH kb_entry and reminder.
+
+TIMEZONE RULE:
+- If the user explicitly names a timezone (e.g. "America/New_York", "EST", "PST", "IST", "UTC"), set reminder.timezone to the IANA timezone string and compute due_datetime_local in THAT timezone.
+- If the user does NOT mention a timezone, set reminder.timezone to null (the system will use the default).
 
 PENDING REMINDER STATE: {pending_reminder}
 If there is a pending reminder, try to fill missing fields from the current message.
@@ -160,6 +164,7 @@ RETURN ONLY VALID JSON (no markdown, no code fences):
   "reminder": {{
     "title": "short descriptive title or Reminder if none given",
     "due_datetime_local": "YYYY-MM-DDTHH:MM:SS",
+    "timezone": "IANA timezone string or null",
     "order_ref": "string or null",
     "related_party": "string or null"
   }} or null,
