@@ -251,8 +251,7 @@ export default function ChatPage() {
           type="button"
           onClick={toggleListening}
           className={listening ? 'mic-active' : ''}
-          disabled={!speechSupported}
-          title={speechSupported ? (listening ? 'Stop listening' : 'Voice input') : 'Voice not supported'}
+          title={listening ? 'Stop listening' : 'Voice input'}
           data-testid="mic-button"
         >
           {listening ? <MicOff size={20} /> : <Mic size={20} />}
