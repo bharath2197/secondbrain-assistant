@@ -1,156 +1,189 @@
-from fastapi import FastAPI, APIRouter, Request, HTTPException
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
 import os
-import logging
-import json
-import uuid
 import re
-import httpx
-import jwt
-from pathlib import Path
-from pydantic import BaseModel
-from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timezone, timedelta
+import json
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, date, time
 from zoneinfo import ZoneInfo
 
-# We use OpenAI SDK with Groq OpenAI-compatible endpoint
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / ".env")
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
-
-if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars")
-
+# -----------------------------------------------------------------------------
+# App + CORS (keep env var CORS_ORIGINS comma-separated with fallback "*")
+# -----------------------------------------------------------------------------
 app = FastAPI()
-api_router = APIRouter(prefix="/api")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+cors_origins_raw = os.getenv("CORS_ORIGINS", "").strip()
+if cors_origins_raw:
+    origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+else:
+    origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-logger = logging.getLogger(__name__)
 
-groq_client = None
-if GROQ_API_KEY:
-    groq_client = AsyncOpenAI(
-        api_key=GROQ_API_KEY,
-        base_url="https://api.groq.com/openai/v1",
-    )
+# -----------------------------------------------------------------------------
+# Env
+# -----------------------------------------------------------------------------
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or ""
+SUPABASE_REST_URL = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
+SUPABASE_AUTH_URL = f"{SUPABASE_URL}/auth/v1" if SUPABASE_URL else ""
 
-# -----------------------------
-# Supabase REST helpers
-# -----------------------------
-class SupabaseREST:
-    def __init__(self, token: str):
-        self.base = f"{SUPABASE_URL}/rest/v1"
-        self.headers = {
-            "apikey": SUPABASE_ANON_KEY,
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = (os.getenv("GROQ_MODEL", "") or "").strip()  # strip whitespace/newlines to avoid model_not_found
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
-    async def select(self, table: str, params: dict = None) -> list:
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(f"{self.base}/{table}", headers=self.headers, params=params or {})
-            if r.status_code >= 400:
-                logger.error(f"Supabase SELECT {table}: {r.status_code} {r.text}")
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-            return r.json()
+DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "America/Los_Angeles")
 
-    async def insert(self, table: str, data: dict) -> list:
-        h = {**self.headers, "Prefer": "return=representation"}
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(f"{self.base}/{table}", headers=h, json=data)
-            if r.status_code >= 400:
-                logger.error(f"Supabase INSERT {table}: {r.status_code} {r.text}")
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-            return r.json()
+openai_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
 
-    async def upsert(self, table: str, data: dict, on_conflict: str = "id") -> list:
-        h = {**self.headers, "Prefer": "return=representation,resolution=merge-duplicates"}
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(f"{self.base}/{table}?on_conflict={on_conflict}", headers=h, json=data)
-            if r.status_code >= 400:
-                logger.error(f"Supabase UPSERT {table}: {r.status_code} {r.text}")
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-            return r.json()
-
-    async def update(self, table: str, data: dict, match: dict) -> list:
-        h = {**self.headers, "Prefer": "return=representation"}
-        params = {k: f"eq.{v}" for k, v in match.items()}
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.patch(f"{self.base}/{table}", headers=h, json=data, params=params)
-            if r.status_code >= 400:
-                logger.error(f"Supabase UPDATE {table}: {r.status_code} {r.text}")
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-            return r.json()
-
-    async def delete(self, table: str, match: dict) -> None:
-        params = {k: f"eq.{v}" for k, v in match.items()}
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.delete(f"{self.base}/{table}", headers=self.headers, params=params)
-            if r.status_code >= 400:
-                logger.error(f"Supabase DELETE {table}: {r.status_code} {r.text}")
-                raise HTTPException(status_code=r.status_code, detail=r.text)
-
-
-# -----------------------------
-# Auth helpers
-# -----------------------------
-def get_token(request: Request) -> str:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing auth token")
-    return auth[7:]
-
-
-def decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, options={"verify_signature": False})
-    except jwt.DecodeError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def get_user_id(request: Request) -> str:
-    payload = decode_token(get_token(request))
-    uid = payload.get("sub")
-    if not uid:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-    return uid
-
-
-def get_db(request: Request) -> SupabaseREST:
-    return SupabaseREST(get_token(request))
-
-
-# -----------------------------
-# Request models
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
+    thread_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    actions: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProfilePatch(BaseModel):
+    timezone: Optional[str] = None
+    display_name: Optional[str] = None
     pending_reminder: Optional[Dict[str, Any]] = None
 
 
-class ProfileUpdate(BaseModel):
-    timezone: str
+# -----------------------------------------------------------------------------
+# Supabase REST helpers (keep Authorization Bearer token from request)
+# -----------------------------------------------------------------------------
+def _require_supabase():
+    if not SUPABASE_URL or not SUPABASE_REST_URL:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
 
 
-class ReminderStatusUpdate(BaseModel):
-    status: str
+def _sb_headers(user_jwt: str) -> Dict[str, str]:
+    # Keep Supabase REST style as-is: pass through user JWT, include anon key.
+    hdrs = {
+        "Authorization": f"Bearer {user_jwt}",
+        "apikey": SUPABASE_ANON_KEY,
+        "Content-Type": "application/json",
+    }
+    return hdrs
 
 
-# -----------------------------
-# Date parsing (server-side)
-# -----------------------------
-WEEKDAYS = {
+async def _sb_get_user(user_jwt: str) -> Dict[str, Any]:
+    _require_supabase()
+    if not SUPABASE_AUTH_URL:
+        raise HTTPException(status_code=500, detail="Supabase auth URL not configured")
+
+    url = f"{SUPABASE_AUTH_URL}/user"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=_sb_headers(user_jwt))
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Supabase token")
+    return r.json()
+
+
+async def _sb_select(
+    user_jwt: str,
+    table: str,
+    select: str = "*",
+    filters: Optional[Dict[str, str]] = None,
+    order: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    _require_supabase()
+    params: Dict[str, str] = {"select": select}
+    if filters:
+        params.update(filters)
+    if order:
+        params["order"] = order
+    if limit is not None:
+        params["limit"] = str(limit)
+
+    url = f"{SUPABASE_REST_URL}/{table}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=_sb_headers(user_jwt), params=params)
+    if r.status_code >= 400:
+        raise HTTPException(status_code=500, detail=f"Supabase select failed: {r.text}")
+    return r.json() or []
+
+
+async def _sb_insert(
+    user_jwt: str,
+    table: str,
+    rows: List[Dict[str, Any]],
+    returning: str = "representation",
+) -> List[Dict[str, Any]]:
+    _require_supabase()
+    url = f"{SUPABASE_REST_URL}/{table}"
+    headers = _sb_headers(user_jwt)
+    headers["Prefer"] = f"return={returning}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, headers=headers, content=json.dumps(rows))
+    if r.status_code >= 400:
+        raise HTTPException(status_code=500, detail=f"Supabase insert failed: {r.text}")
+    return r.json() or []
+
+
+async def _sb_upsert(
+    user_jwt: str,
+    table: str,
+    rows: List[Dict[str, Any]],
+    on_conflict: Optional[str] = None,
+    returning: str = "representation",
+) -> List[Dict[str, Any]]:
+    _require_supabase()
+    url = f"{SUPABASE_REST_URL}/{table}"
+    headers = _sb_headers(user_jwt)
+    prefer_parts = [f"return={returning}", "resolution=merge-duplicates"]
+    headers["Prefer"] = ", ".join(prefer_parts)
+    params = {}
+    if on_conflict:
+        params["on_conflict"] = on_conflict
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, headers=headers, params=params, content=json.dumps(rows))
+    if r.status_code >= 400:
+        raise HTTPException(status_code=500, detail=f"Supabase upsert failed: {r.text}")
+    return r.json() or []
+
+
+async def _sb_patch(
+    user_jwt: str,
+    table: str,
+    filters: Dict[str, str],
+    patch: Dict[str, Any],
+    returning: str = "representation",
+) -> List[Dict[str, Any]]:
+    _require_supabase()
+    url = f"{SUPABASE_REST_URL}/{table}"
+    headers = _sb_headers(user_jwt)
+    headers["Prefer"] = f"return={returning}"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.patch(url, headers=headers, params=filters, content=json.dumps(patch))
+    if r.status_code >= 400:
+        raise HTTPException(status_code=500, detail=f"Supabase patch failed: {r.text}")
+    return r.json() or []
+
+
+# -----------------------------------------------------------------------------
+# Time parsing and reminder parsing helpers
+# -----------------------------------------------------------------------------
+WEEKDAY_MAP = {
     "monday": 0,
     "mon": 0,
     "tuesday": 1,
@@ -170,437 +203,665 @@ WEEKDAYS = {
     "sun": 6,
 }
 
-TIME_RE = re.compile(
-    r"\b(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>am|pm)?\b",
+# Bug fix 1: strict time parsing.
+# ONLY parse explicit times like "3pm", "3 pm", "3:30pm", or "15:30".
+# Do not parse naked numbers.
+TIME_12H_RE = re.compile(r"\b(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*(am|pm)\b", re.IGNORECASE)
+TIME_24H_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
+
+# Relative duration patterns
+IN_DAYS_RE = re.compile(r"\b(in\s+)?(\d+)\s+day(s)?\b", re.IGNORECASE)
+IN_WEEKS_RE = re.compile(r"\b(in\s+)?(\d+)\s+week(s)?\b", re.IGNORECASE)
+IN_HOURS_RE = re.compile(r"\b(in\s+)?(\d+)\s+hour(s)?\b", re.IGNORECASE)
+TOMORROW_RE = re.compile(r"\btomorrow\b", re.IGNORECASE)
+TODAY_RE = re.compile(r"\btoday\b", re.IGNORECASE)
+
+NEXT_THIS_WEEKDAY_RE = re.compile(
+    r"\b(?:(next|this)\s+)?(mon(day)?|tue(s(day)?)?|wed(nesday)?|thu(r(s(day)?)?)?|fri(day)?|sat(urday)?|sun(day)?)\b",
     re.IGNORECASE,
 )
 
-IN_WEEKS_RE = re.compile(r"\bin\s+(?P<n>\d+)\s+weeks?\b", re.IGNORECASE)
-IN_DAYS_RE = re.compile(r"\bin\s+(?P<n>\d+)\s+days?\b", re.IGNORECASE)
+AT_RE = re.compile(r"\bat\b", re.IGNORECASE)
 
-THIS_NEXT_DOW_RE = re.compile(
-    r"\b(?:(?P<prefix>this|next)\s+)?(?P<dow>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday|r|rday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
-    re.IGNORECASE,
-)
+# "follow up" style defaults
+DEFAULT_REMINDER_TIME = time(9, 0)  # 09:00 local when no explicit time is provided
 
-def _parse_time_from_text(text: str) -> Optional[Tuple[int, int]]:
+
+def _safe_tz(tz_name: Optional[str]) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name or DEFAULT_TIMEZONE)
+    except Exception:
+        return ZoneInfo(DEFAULT_TIMEZONE)
+
+
+def _now_local(tz: ZoneInfo) -> datetime:
+    return datetime.now(tz)
+
+
+def _format_dt_local(dt_local: datetime, tz_name: str) -> str:
+    # "Mon D, YYYY at H:MM AM/PM (Timezone)"
+    # Example: "Feb 27, 2026 at 3:00 PM (America/Los_Angeles)"
+    mon = dt_local.strftime("%b")
+    day = dt_local.day
+    yr = dt_local.year
+    hm = dt_local.strftime("%I:%M %p").lstrip("0")
+    return f"{mon} {day}, {yr} at {hm} ({tz_name})"
+
+
+def _parse_explicit_time(text: str) -> Optional[time]:
     """
-    Returns (hour24, minute) if a time exists in the message.
-    Accepts: 3pm, 3 pm, 15:30, 3:30pm, etc.
+    Bug fix 1: strict time parsing that ignores naked numbers.
     """
-    m = TIME_RE.search(text)
-    if not m:
-        return None
-    h = int(m.group("h"))
-    minute = int(m.group("m") or "0")
-    ampm = (m.group("ampm") or "").lower()
+    m24 = TIME_24H_RE.search(text)
+    if m24:
+        hh = int(m24.group(1))
+        mm = int(m24.group(2))
+        return time(hh, mm)
 
-    if ampm:
-        if h == 12:
-            h = 0
-        if ampm == "pm":
-            h += 12
-    return (h, minute)
-
-def _next_weekday(base: datetime, weekday: int) -> datetime:
-    """Next occurrence of weekday (could be today if same weekday)."""
-    days_ahead = (weekday - base.weekday()) % 7
-    return base + timedelta(days=days_ahead)
-
-def _resolve_relative_due_datetime(message: str, user_tz: str) -> Optional[str]:
-    """
-    Deterministic parser for a few key cases:
-    - "in 2 weeks", "in 10 days"
-    - "Friday at 3pm", "this Friday 3pm", "next Friday 3pm"
-    Defaults time to 09:00 if missing.
-    Returns ISO local string: YYYY-MM-DDTHH:MM:SS
-    """
-    text = message.strip().lower()
-    now_local = datetime.now(ZoneInfo(user_tz))
-
-    # in N weeks
-    m = IN_WEEKS_RE.search(text)
-    if m:
-        n = int(m.group("n"))
-        target = now_local + timedelta(weeks=n)
-        hr_min = _parse_time_from_text(text) or (9, 0)
-        target = target.replace(hour=hr_min[0], minute=hr_min[1], second=0, microsecond=0)
-        return target.replace(tzinfo=None).isoformat()
-
-    # in N days
-    m = IN_DAYS_RE.search(text)
-    if m:
-        n = int(m.group("n"))
-        target = now_local + timedelta(days=n)
-        hr_min = _parse_time_from_text(text) or (9, 0)
-        target = target.replace(hour=hr_min[0], minute=hr_min[1], second=0, microsecond=0)
-        return target.replace(tzinfo=None).isoformat()
-
-    # weekday patterns
-    m = THIS_NEXT_DOW_RE.search(text)
-    if m:
-        prefix = (m.group("prefix") or "").lower()
-        dow_raw = (m.group("dow") or "").lower()
-        dow_key = dow_raw[:3] if dow_raw[:3] in WEEKDAYS else dow_raw
-        weekday = WEEKDAYS.get(dow_key)
-        if weekday is None:
-            return None
-
-        base_date = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        upcoming = _next_weekday(base_date, weekday)
-
-        # If it's "Friday" and today is Friday, we interpret as today (upcoming = today)
-        # If user says "next Friday", force next week's Friday
-        if prefix == "next":
-            upcoming = upcoming + timedelta(days=7)
-
-        # If prefix empty or "this": use upcoming (today or this week's upcoming)
-        hr_min = _parse_time_from_text(text) or (9, 0)
-        target = upcoming.replace(hour=hr_min[0], minute=hr_min[1], second=0, microsecond=0)
-        return target.replace(tzinfo=None).isoformat()
+    m12 = TIME_12H_RE.search(text)
+    if m12:
+        hh = int(m12.group(1))
+        mm = int(m12.group(2) or "0")
+        ampm = (m12.group(3) or "").lower()
+        if ampm == "pm" and hh != 12:
+            hh += 12
+        if ampm == "am" and hh == 12:
+            hh = 0
+        return time(hh, mm)
 
     return None
 
 
-def local_to_utc(local_dt_str: str, tz_str: str) -> str:
-    local_dt = datetime.fromisoformat(local_dt_str)
-    if local_dt.tzinfo is None:
-        local_dt = local_dt.replace(tzinfo=ZoneInfo(tz_str))
-    return local_dt.astimezone(ZoneInfo("UTC")).isoformat()
+def _next_weekday(base_date: date, target_weekday: int) -> date:
+    days_ahead = (target_weekday - base_date.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return base_date + timedelta(days=days_ahead)
 
 
-# -----------------------------
-# LLM Extraction (Groq)
-# -----------------------------
-EXTRACTION_PROMPT = """You are SecondBrain, a personal assistant. Process the user's message and determine the appropriate action.
-
-Current date/time (user's local): {now}
-User's default timezone: {timezone}
-
-RULES:
-1. If the message contains ONLY factual information (a fact, note, contact info, order details, preferences) with NO date/time/follow-up intent, classify as "kb".
-2. If the message mentions ONLY a future action, deadline, or follow-up with date/time intent, classify as "reminder".
-3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, you MUST classify as "both" and fill BOTH kb_entry AND reminder.
-4. If a reminder is being built (see PENDING STATE) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
-5. For general conversation or greetings, classify as "chat".
-
-IMPORTANT:
-- If the user gives relative time like "next Friday at 3pm" or "in 2 weeks", you may set due_datetime_local, BUT the server may override it.
-- The ONLY required reminder field is due_datetime_local. If missing, return type "clarify" and ask for date/time.
-
-PENDING REMINDER STATE: {pending_reminder}
-
-RETURN ONLY VALID JSON:
-{{
-  "type": "kb" | "reminder" | "both" | "clarify" | "chat",
-  "kb_entry": {{
-    "entity_type": "note" | "contact" | "order" | "fact",
-    "entity_name": "string or null",
-    "order_ref": "string or null",
-    "details": "the key information extracted"
-  }} or null,
-  "reminder": {{
-    "title": "short descriptive title or Reminder if none given",
-    "due_datetime_local": "YYYY-MM-DDTHH:MM:SS",
-    "timezone": "IANA timezone string or null",
-    "order_ref": "string or null",
-    "related_party": "string or null"
-  }} or null,
-  "clarify_question": "string or null",
-  "updated_pending": {{
-    "title": "string or null",
-    "due_datetime_local": "string or null",
-    "order_ref": "string or null",
-    "related_party": "string or null"
-  }} or null,
-  "response": "natural language response confirming what you did"
-}}"""
+def _upcoming_weekday_including_today(base_date: date, target_weekday: int) -> date:
+    days_ahead = (target_weekday - base_date.weekday()) % 7
+    return base_date + timedelta(days=days_ahead)
 
 
-async def extract_message(message: str, user_tz: str, pending: dict = None, recent: list = None) -> dict:
-    now_str = datetime.now(ZoneInfo(user_tz)).strftime("%Y-%m-%d %H:%M:%S %A")
-    system_msg = EXTRACTION_PROMPT.format(
-        now=now_str,
-        timezone=user_tz,
-        pending_reminder=json.dumps(pending) if pending else "None",
-    )
+def _resolve_weekday_date(
+    base_date: date,
+    target_weekday: int,
+    qualifier: Optional[str],
+) -> date:
+    """
+    Interprets:
+      - "Friday" => upcoming Friday (including today if today is Friday)
+      - "this Friday" => upcoming Friday (including today if today is Friday)
+      - "next Friday" => Friday of next week (always +7 from upcoming)
+    """
+    qualifier_norm = (qualifier or "").lower().strip()
+    upcoming = _upcoming_weekday_including_today(base_date, target_weekday)
 
-    # Fallback: if Groq key missing, do basic behavior
-    if not groq_client:
-        return {
-            "type": "chat",
-            "kb_entry": None,
-            "reminder": None,
-            "clarify_question": None,
-            "updated_pending": None,
-            "response": "LLM not configured.",
-        }
+    if qualifier_norm == "next":
+        # If upcoming is this week's occurrence (possibly tomorrow), "next" means one week after that.
+        return upcoming + timedelta(days=7)
+    # "this" or none
+    return upcoming
 
-    parts = []
-    if recent:
-        parts.append("Recent conversation:")
-        for m in recent[-6:]:
-            parts.append(f"  {m['role']}: {m['content']}")
-        parts.append("")
-    parts.append(f"User says: {message}")
 
-    try:
-        resp = await groq_client.chat.completions.create(
-            model=GROQ_MODEL.strip(),
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": "\n".join(parts)},
-            ],
-            temperature=0.2,
-        )
-        text = (resp.choices[0].message.content or "").strip()
+def _parse_due_datetime_local(
+    text: str,
+    tz_name: str,
+    now_local: Optional[datetime] = None,
+    pending_reminder: Optional[Dict[str, Any]] = None,
+) -> Optional[datetime]:
+    """
+    Returns a timezone-aware local datetime if parseable, else None.
+
+    Bug fix 3: pending reminder carry-over.
+    If user says a weekday without a time and pending_reminder has due_datetime_local,
+    reuse its hour/minute rather than defaulting to 09:00.
+    """
+    tz = _safe_tz(tz_name)
+    now = now_local or _now_local(tz)
+    text_l = text.strip()
+
+    explicit_t = _parse_explicit_time(text_l)
+
+    # Determine the time to use if missing:
+    # Bug fix 3: carry over hour/minute from pending reminder if available.
+    carried_time: Optional[time] = None
+    if pending_reminder and isinstance(pending_reminder, dict):
+        prior = pending_reminder.get("due_datetime_local")
+        if isinstance(prior, str) and prior:
+            try:
+                prior_dt = datetime.fromisoformat(prior)
+                if prior_dt.tzinfo is None:
+                    prior_dt = prior_dt.replace(tzinfo=tz)
+                carried_time = prior_dt.timetz().replace(tzinfo=None)  # time object
+            except Exception:
+                carried_time = None
+
+    def pick_time() -> time:
+        if explicit_t:
+            return explicit_t
+        if carried_time:
+            return time(carried_time.hour, carried_time.minute)
+        return DEFAULT_REMINDER_TIME
+
+    # today/tomorrow
+    if TOMORROW_RE.search(text_l):
+        d = (now + timedelta(days=1)).date()
+        return datetime.combine(d, pick_time(), tzinfo=tz)
+    if TODAY_RE.search(text_l):
+        d = now.date()
+        return datetime.combine(d, pick_time(), tzinfo=tz)
+
+    # relative durations (in X days/weeks/hours)
+    m_weeks = IN_WEEKS_RE.search(text_l)
+    if m_weeks:
+        weeks = int(m_weeks.group(2))
+        d = (now + timedelta(days=7 * weeks)).date()
+        return datetime.combine(d, pick_time(), tzinfo=tz)
+
+    m_days = IN_DAYS_RE.search(text_l)
+    if m_days:
+        days = int(m_days.group(2))
+        d = (now + timedelta(days=days)).date()
+        return datetime.combine(d, pick_time(), tzinfo=tz)
+
+    m_hours = IN_HOURS_RE.search(text_l)
+    if m_hours:
+        hours = int(m_hours.group(2))
+        # If user gives hours, keep it as now + hours (but if no explicit minutes, keep minute=0)
+        dt = now + timedelta(hours=hours)
+        if explicit_t:
+            # If they explicitly included a time, treat it as a clock time (rare with hours phrasing)
+            dt = datetime.combine(dt.date(), explicit_t, tzinfo=tz)
+        else:
+            dt = dt.replace(second=0, microsecond=0)
+        return dt
+
+    # weekdays (next/this/none)
+    m_wd = NEXT_THIS_WEEKDAY_RE.search(text_l)
+    if m_wd:
+        qualifier = m_wd.group(1)  # next/this/None
+        wd_token = (m_wd.group(2) or "").lower()
+        wd_token = re.sub(r"[^a-z]", "", wd_token)
+        if wd_token in WEEKDAY_MAP:
+            target = WEEKDAY_MAP[wd_token]
+            resolved_date = _resolve_weekday_date(now.date(), target, qualifier)
+            return datetime.combine(resolved_date, pick_time(), tzinfo=tz)
+
+    return None
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort: find a JSON object in a model response.
+    """
+    if not text:
+        return None
+    text = text.strip()
+
+    # If it's already JSON
+    if text.startswith("{") and text.endswith("}"):
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r"\{[\s\S]*\}", text)
-            if m:
-                try:
-                    return json.loads(m.group())
-                except json.JSONDecodeError:
-                    pass
-            return {
-                "type": "chat",
-                "kb_entry": None,
-                "reminder": None,
-                "clarify_question": None,
-                "updated_pending": None,
-                "response": text or "LLM returned empty response",
-            }
-    except Exception:
-        logger.exception("Groq call failed")
-        return {
-            "type": "chat",
-            "kb_entry": None,
-            "reminder": None,
-            "clarify_question": None,
-            "updated_pending": None,
-            "response": "LLM failed. Please try again.",
-        }
-
-
-# -----------------------------
-# API Endpoints
-# -----------------------------
-@api_router.get("/")
-async def root():
-    return {"status": "ok", "service": "SecondBrain API"}
-
-
-@api_router.get("/profile")
-async def get_profile(request: Request):
-    db = get_db(request)
-    uid = get_user_id(request)
-    rows = await db.select("user_profile", {"id": f"eq.{uid}"})
-    return rows[0] if rows else None
-
-
-@api_router.post("/profile")
-async def upsert_profile(body: ProfileUpdate, request: Request):
-    db = get_db(request)
-    uid = get_user_id(request)
-    email = decode_token(get_token(request)).get("email", "")
-    data = {"id": uid, "user_email": email, "timezone": body.timezone}
-    result = await db.upsert("user_profile", data, on_conflict="id")
-    return result[0] if result else data
-
-
-@api_router.post("/chat")
-async def chat_endpoint(body: ChatRequest, request: Request):
-    db = get_db(request)
-    uid = get_user_id(request)
-
-    # Get timezone
-    profiles = await db.select("user_profile", {"id": f"eq.{uid}"})
-    user_tz = profiles[0]["timezone"] if profiles else "UTC"
-
-    # Recent messages for context
-    recent = await db.select(
-        "chat_messages",
-        {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": "10"},
-    )
-    recent.reverse()
-
-    # Save user message
-    await db.insert("chat_messages", {"user_id": uid, "role": "user", "content": body.message})
-
-    # LLM extraction
-    extraction = await extract_message(
-        body.message,
-        user_tz,
-        body.pending_reminder,
-        [{"role": m["role"], "content": m["content"]} for m in recent],
-    )
-
-    result_type = extraction.get("type", "chat")
-    response_text = extraction.get("response", "Got it!")
-    saved_kb = None
-    saved_reminder = None
-
-    # If reminder includes a relative expression, override due_datetime_local deterministically
-    def _override_due_if_relative(rem: dict) -> dict:
-        if not rem:
-            return rem
-        forced = _resolve_relative_due_datetime(body.message, user_tz)
-        if forced:
-            rem = {**rem, "due_datetime_local": forced}
-        return rem
-
-    # Treat inconsistent LLM outputs as "both"
-    if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
-        result_type = "both"
-    if result_type == "kb" and extraction.get("reminder") and extraction.get("kb_entry"):
-        result_type = "both"
-
-    async def _save_kb(kb_data):
-        entry = {
-            "user_id": uid,
-            "entity_type": kb_data.get("entity_type", "note"),
-            "entity_name": kb_data.get("entity_name"),
-            "order_ref": kb_data.get("order_ref"),
-            "details": kb_data.get("details", body.message),
-            "source_message": body.message,
-        }
-        rows = await db.insert("kb_entries", entry)
-        return rows[0] if rows else entry
-
-    async def _save_reminder(rem_data):
-        rem_data = _override_due_if_relative(rem_data)
-
-        due_local = rem_data.get("due_datetime_local", "")
-        title = rem_data.get("title") or "Reminder"
-
-        explicit_tz = rem_data.get("timezone")
-        eff_tz = explicit_tz if explicit_tz else user_tz
-
-        if not due_local:
-            raise HTTPException(status_code=400, detail="Reminder missing due_datetime_local")
-
-        due_utc = local_to_utc(due_local, eff_tz)
-
-        rdata = {
-            "user_id": uid,
-            "title": title,
-            "due_datetime": due_utc,
-            "timezone": eff_tz,
-            "related_order_ref": rem_data.get("order_ref"),
-            "related_party": rem_data.get("related_party"),
-            "status": "open",
-            "source_message": body.message,
-        }
-        rows = await db.insert("reminders", rdata)
-        saved = rows[0] if rows else rdata
-
-        # absolute confirmation text
-        try:
-            dt_local = datetime.fromisoformat(due_local).replace(tzinfo=ZoneInfo(eff_tz))
-            abs_str = dt_local.strftime("%b %-d, %Y at %-I:%M %p")
-            saved["_confirmation"] = f"Reminder created: {title} - {abs_str} ({eff_tz})"
         except Exception:
             pass
 
-        return saved
-
-    # Process
-    if result_type == "both":
-        if extraction.get("kb_entry"):
-            saved_kb = await _save_kb(extraction["kb_entry"])
-        if extraction.get("reminder"):
-            saved_reminder = await _save_reminder(extraction["reminder"])
-
-        parts = []
-        if saved_kb:
-            parts.append(f"Saved to Knowledge Base: {saved_kb.get('details','')[:80]}")
-        if saved_reminder and saved_reminder.get("_confirmation"):
-            parts.append(saved_reminder["_confirmation"])
-        if parts:
-            response_text = " | ".join(parts)
-
-    elif result_type == "kb" and extraction.get("kb_entry"):
-        saved_kb = await _save_kb(extraction["kb_entry"])
-
-    elif result_type == "reminder" and extraction.get("reminder"):
-        saved_reminder = await _save_reminder(extraction["reminder"])
-        if saved_reminder and saved_reminder.get("_confirmation"):
-            response_text = saved_reminder["_confirmation"]
-
-    # Save assistant message
-    await db.insert("chat_messages", {"user_id": uid, "role": "assistant", "content": response_text})
-
-    return {
-        "type": result_type,
-        "response": response_text,
-        "kb_entry": saved_kb,
-        "reminder": saved_reminder,
-        "clarify_question": extraction.get("clarify_question"),
-        "updated_pending": extraction.get("updated_pending"),
-    }
+    # Try to locate first {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        blob = text[start : end + 1]
+        try:
+            return json.loads(blob)
+        except Exception:
+            return None
+    return None
 
 
-@api_router.get("/messages")
-async def get_messages(request: Request, limit: int = 200):
-    db = get_db(request)
-    uid = get_user_id(request)
+def _build_system_prompt(tz_name: str) -> str:
+    return (
+        "You are SecondBrain Assistant. Extract structured actions.\n"
+        "Return ONLY a JSON object with keys:\n"
+        '  "type": one of ["message","reminder","kb","mixed","clarify"]\n'
+        '  "reply": a helpful assistant reply to show the user\n'
+        '  "reminder": optional object { "title": string, "due_text": string }\n'
+        '  "kb": optional object { "content": string }\n'
+        '  "clarify_question": optional string when type="clarify"\n'
+        "Rules:\n"
+        "1) If user asks to remember/save a fact, use kb.\n"
+        "2) If user asks to be reminded at a time/date, use reminder.\n"
+        "3) For mixed (both), include both.\n"
+        "4) Use the user's timezone: "
+        + tz_name
+        + "\n"
+        "5) If date is ambiguous and cannot be resolved, use type=clarify and ask one question.\n"
+    )
 
-    # Important: fetch newest first then reverse so UI shows chronological
-    rows = await db.select(
-        "chat_messages",
-        {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": str(limit)},
+
+# -----------------------------------------------------------------------------
+# Profile helpers (including pending reminder storage for bug fix 3)
+# -----------------------------------------------------------------------------
+async def _get_profile(user_jwt: str, user_id: str) -> Dict[str, Any]:
+    rows = await _sb_select(
+        user_jwt,
+        "profiles",
+        select="user_id,timezone,display_name,pending_reminder",
+        filters={"user_id": f"eq.{user_id}"},
+        limit=1,
+    )
+    if rows:
+        prof = rows[0]
+        # Ensure defaults
+        prof.setdefault("timezone", DEFAULT_TIMEZONE)
+        prof.setdefault("pending_reminder", None)
+        return prof
+
+    # Create if missing
+    created = await _sb_insert(
+        user_jwt,
+        "profiles",
+        [
+            {
+                "user_id": user_id,
+                "timezone": DEFAULT_TIMEZONE,
+                "display_name": None,
+                "pending_reminder": None,
+            }
+        ],
+    )
+    return created[0] if created else {"user_id": user_id, "timezone": DEFAULT_TIMEZONE, "pending_reminder": None}
+
+
+async def _set_pending_reminder(user_jwt: str, user_id: str, pending: Optional[Dict[str, Any]]) -> None:
+    await _sb_upsert(
+        user_jwt,
+        "profiles",
+        [{"user_id": user_id, "pending_reminder": pending}],
+        on_conflict="user_id",
+        returning="minimal",
+    )
+
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/api/profile")
+async def get_profile(authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    prof = await _get_profile(token, user_id)
+    return {"user": {"id": user_id, "email": user.get("email")}, "profile": prof}
+
+
+@app.patch("/api/profile")
+async def patch_profile(payload: ProfilePatch, authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    patch: Dict[str, Any] = {}
+    if payload.timezone is not None:
+        patch["timezone"] = payload.timezone
+    if payload.display_name is not None:
+        patch["display_name"] = payload.display_name
+    if payload.pending_reminder is not None:
+        patch["pending_reminder"] = payload.pending_reminder
+
+    if not patch:
+        prof = await _get_profile(token, user_id)
+        return {"profile": prof}
+
+    rows = await _sb_upsert(token, "profiles", [{"user_id": user_id, **patch}], on_conflict="user_id")
+    return {"profile": rows[0] if rows else await _get_profile(token, user_id)}
+
+
+@app.get("/api/messages")
+async def get_messages(
+    request: Request,
+    limit: int = 200,  # Bug fix 4: default limit 200
+    authorization: str = Header(default=""),
+):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    # Bug fix 4: fetch desc then reverse so latest messages reliably appear after relogin
+    rows = await _sb_select(
+        token,
+        "messages",
+        select="id,created_at,role,content,thread_id,metadata",
+        filters={"user_id": f"eq.{user_id}"},
+        order="created_at.desc",
+        limit=limit,
     )
     rows.reverse()
-    return rows
+    return {"messages": rows}
 
 
-@api_router.get("/kb")
-async def get_kb(request: Request, entity_type: str = None, search: str = None):
-    db = get_db(request)
-    uid = get_user_id(request)
-    params: dict = {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": "100"}
-    if entity_type:
-        params["entity_type"] = f"eq.{entity_type}"
-    if search:
-        params["or"] = f"(details.ilike.%{search}%,entity_name.ilike.%{search}%,order_ref.ilike.%{search}%)"
-    return await db.select("kb_entries", params)
+@app.get("/api/kb")
+async def get_kb(limit: int = 200, authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    rows = await _sb_select(
+        token,
+        "kb",
+        select="id,created_at,content,source,metadata",
+        filters={"user_id": f"eq.{user_id}"},
+        order="created_at.desc",
+        limit=limit,
+    )
+    return {"kb": rows}
 
 
-@api_router.delete("/kb/{entry_id}")
-async def delete_kb(entry_id: str, request: Request):
-    db = get_db(request)
-    uid = get_user_id(request)
-    await db.delete("kb_entries", {"id": entry_id, "user_id": uid})
-    return {"ok": True}
+@app.post("/api/kb")
+async def add_kb(payload: Dict[str, Any], authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    content = (payload.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Missing content")
+
+    row = {
+        "user_id": user_id,
+        "content": content,
+        "source": payload.get("source") or "user",
+        "metadata": payload.get("metadata") or {},
+    }
+    created = await _sb_insert(token, "kb", [row])
+    return {"kb": created[0] if created else row}
 
 
-@api_router.get("/reminders")
-async def get_reminders(request: Request, status: str = None):
-    db = get_db(request)
-    uid = get_user_id(request)
-    params: dict = {"user_id": f"eq.{uid}", "order": "due_datetime.asc", "limit": "500"}
-    if status:
-        params["status"] = f"eq.{status}"
-    return await db.select("reminders", params)
+@app.get("/api/reminders")
+async def get_reminders(limit: int = 200, authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    rows = await _sb_select(
+        token,
+        "reminders",
+        select="id,created_at,title,due_datetime_local,timezone,status,metadata",
+        filters={"user_id": f"eq.{user_id}"},
+        order="due_datetime_local.asc",
+        limit=limit,
+    )
+    return {"reminders": rows}
 
 
-@api_router.patch("/reminders/{reminder_id}")
-async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request: Request):
-    db = get_db(request)
-    uid = get_user_id(request)
-    result = await db.update("reminders", {"status": body.status}, {"id": reminder_id, "user_id": uid})
-    return result[0] if result else {"ok": True}
+@app.post("/api/reminders")
+async def create_reminder(payload: Dict[str, Any], authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    prof = await _get_profile(token, user_id)
+    tz_name = prof.get("timezone") or DEFAULT_TIMEZONE
+
+    title = (payload.get("title") or "").strip() or "Reminder"
+    due_text = (payload.get("due_text") or "").strip()
+    due_dt = _parse_due_datetime_local(due_text, tz_name, pending_reminder=prof.get("pending_reminder"))
+
+    if not due_dt:
+        raise HTTPException(status_code=400, detail="Unable to parse due date/time")
+
+    row = {
+        "user_id": user_id,
+        "title": title,
+        "due_datetime_local": due_dt.isoformat(),
+        "timezone": tz_name,
+        "status": "scheduled",
+        "metadata": payload.get("metadata") or {},
+    }
+    created = await _sb_insert(token, "reminders", [row])
+    await _set_pending_reminder(token, user_id, None)
+    return {"reminder": created[0] if created else row}
 
 
-# -----------------------------
-# Middleware & startup
-# -----------------------------
-app.include_router(api_router)
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# -----------------------------------------------------------------------------
+# /api/chat (Groq + reminder + kb)
+# -----------------------------------------------------------------------------
+@app.post("/api/chat")
+async def chat(req: ChatRequest, authorization: str = Header(default="")):
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+
+    if not GROQ_API_KEY or not GROQ_MODEL:
+        raise HTTPException(status_code=500, detail="Groq not configured (GROQ_API_KEY / GROQ_MODEL)")
+
+    user = await _sb_get_user(token)
+    user_id = user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
+    prof = await _get_profile(token, user_id)
+    tz_name = prof.get("timezone") or DEFAULT_TIMEZONE
+    tz = _safe_tz(tz_name)
+    now = _now_local(tz)
+
+    user_text = (req.message or "").strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Empty message")
+
+    # Store user message
+    await _sb_insert(
+        token,
+        "messages",
+        [
+            {
+                "user_id": user_id,
+                "role": "user",
+                "content": user_text,
+                "thread_id": req.thread_id,
+                "metadata": req.metadata or {},
+            }
+        ],
+        returning="minimal",
+    )
+
+    # Pull recent messages for context
+    history = await _sb_select(
+        token,
+        "messages",
+        select="created_at,role,content",
+        filters={"user_id": f"eq.{user_id}"},
+        order="created_at.desc",
+        limit=30,
+    )
+    history.reverse()
+
+    system_prompt = _build_system_prompt(tz_name)
+
+    chat_messages = [{"role": "system", "content": system_prompt}]
+    for m in history:
+        role = m.get("role") or "user"
+        content = m.get("content") or ""
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        chat_messages.append({"role": role, "content": content})
+
+    # If we have a pending reminder (after a clarification question), feed it to the model.
+    pending = prof.get("pending_reminder")
+    if pending:
+        chat_messages.append(
+            {
+                "role": "system",
+                "content": f"Pending reminder context (server-side): {json.dumps(pending)}",
+            }
+        )
+
+    # Call Groq
+    try:
+        completion = await openai_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=chat_messages,
+            temperature=0.2,
+        )
+        raw = (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Groq error: {str(e)}")
+
+    parsed = _extract_json_object(raw) or {}
+    action_type = (parsed.get("type") or "message").strip().lower()
+    reply_text = (parsed.get("reply") or "").strip() or "OK."
+
+    reminder_obj = parsed.get("reminder") if isinstance(parsed.get("reminder"), dict) else None
+    kb_obj = parsed.get("kb") if isinstance(parsed.get("kb"), dict) else None
+    clarify_q = (parsed.get("clarify_question") or "").strip()
+
+    actions: Dict[str, Any] = {"llm_type": action_type}
+
+    created_reminder: Optional[Dict[str, Any]] = None
+    created_kb: Optional[Dict[str, Any]] = None
+
+    # Try to create KB if requested
+    if action_type in ("kb", "mixed") and kb_obj:
+        kb_content = (kb_obj.get("content") or "").strip()
+        if kb_content:
+            kb_row = {
+                "user_id": user_id,
+                "content": kb_content,
+                "source": "chat",
+                "metadata": {"thread_id": req.thread_id, "captured_at": now.isoformat()},
+            }
+            created = await _sb_insert(token, "kb", [kb_row])
+            created_kb = created[0] if created else kb_row
+            actions["kb_saved"] = True
+
+    # Reminder flow
+    # Bug fix 2: if LLM returns type="clarify" but server-side parser can resolve due_datetime_local, override and create.
+    wants_reminder = action_type in ("reminder", "mixed", "clarify") and reminder_obj is not None
+
+    if wants_reminder and reminder_obj:
+        title = (reminder_obj.get("title") or "").strip() or "Reminder"
+        due_text = (reminder_obj.get("due_text") or "").strip()
+
+        # Server-side parse with strict time parsing (bug fix 1) and pending carry-over (bug fix 3)
+        due_dt = _parse_due_datetime_local(
+            due_text if due_text else user_text,
+            tz_name,
+            now_local=now,
+            pending_reminder=pending,
+        )
+
+        if due_dt:
+            # Bug fix 2: override clarify if parseable
+            reminder_row = {
+                "user_id": user_id,
+                "title": title,
+                "due_datetime_local": due_dt.isoformat(),
+                "timezone": tz_name,
+                "status": "scheduled",
+                "metadata": {"thread_id": req.thread_id, "source_text": user_text},
+            }
+            created = await _sb_insert(token, "reminders", [reminder_row])
+            created_reminder = created[0] if created else reminder_row
+            actions["reminder_created"] = True
+            await _set_pending_reminder(token, user_id, None)
+
+            # Confirmation formatting must remain
+            confirm = f"Reminder created: {title} - {_format_dt_local(due_dt, tz_name)}"
+            reply_text = confirm if action_type != "mixed" else (reply_text + "\n\n" + confirm).strip()
+        else:
+            # Not parseable. Store pending reminder so a follow-up like "this friday" can keep the time (bug fix 3).
+            pending_payload = {
+                "title": title,
+                "due_text": due_text,
+                # store any known time by attempting explicit parse against the original text
+                "due_datetime_local": None,
+                "timezone": tz_name,
+                "source_text": user_text,
+                "created_at": now.isoformat(),
+            }
+
+            # If original message had an explicit time, save it as "today at that time" placeholder
+            explicit_t = _parse_explicit_time(user_text)
+            if explicit_t:
+                placeholder = datetime.combine(now.date(), explicit_t, tzinfo=tz)
+                pending_payload["due_datetime_local"] = placeholder.isoformat()
+
+            await _set_pending_reminder(token, user_id, pending_payload)
+            actions["pending_reminder"] = True
+
+            if clarify_q:
+                reply_text = clarify_q
+            else:
+                reply_text = "Which date should I set this reminder for?"
+
+    # Store assistant message
+    await _sb_insert(
+        token,
+        "messages",
+        [
+            {
+                "user_id": user_id,
+                "role": "assistant",
+                "content": reply_text,
+                "thread_id": req.thread_id,
+                "metadata": {"actions": actions},
+            }
+        ],
+        returning="minimal",
+    )
+
+    if created_reminder:
+        actions["reminder"] = created_reminder
+    if created_kb:
+        actions["kb"] = created_kb
+
+    return ChatResponse(reply=reply_text, actions=actions)
+
+
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {
+        "ok": True,
+        "service": "secondbrain-backend",
+        "groq_model": GROQ_MODEL,
+        "cors_origins": origins,
+    }
