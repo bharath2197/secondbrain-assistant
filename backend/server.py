@@ -132,21 +132,25 @@ Current date/time (user's local): {now}
 User's timezone: {timezone}
 
 RULES:
-1. If the message contains information to remember (a fact, note, contact info, order details, preferences), classify as "kb".
-2. If the message mentions a future action, deadline, follow-up, or contains date/time intent, classify as "reminder".
-3. If a reminder is being built (see PENDING STATE below) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
-4. For general conversation or greetings, classify as "chat".
-5. Required reminder fields: title, due_datetime_local. Only ask about these if truly missing.
-6. If the user provides a relative time like "tomorrow" or "next Monday at 3pm", compute the actual date from the current date/time.
-7. If no time is given for a reminder, default to 09:00.
-8. Once all required reminder fields are present, create the reminder immediately. Do NOT ask more questions.
+1. If the message contains ONLY factual information (a fact, note, contact info, order details, preferences) with NO date/time/follow-up intent, classify as "kb".
+2. If the message mentions ONLY a future action, deadline, or follow-up with date/time intent, classify as "reminder".
+3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, classify as "both". Fill BOTH kb_entry and reminder fields.
+4. If a reminder is being built (see PENDING STATE) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
+5. For general conversation or greetings, classify as "chat".
+
+REMINDER RULES:
+- The ONLY truly required field is due_datetime_local. If the user gives a date/time but no explicit task/subject, set title to "Reminder" and create immediately. Do NOT ask for title.
+- If the user provides a relative time like "tomorrow" or "next Monday at 3pm", compute the actual date from the current date/time.
+- If no time is given for a reminder, default to 09:00.
+- Once due_datetime_local is present, create the reminder immediately. Do NOT ask more questions.
+- Extract order_ref/reference numbers (PO, INV, CASE, etc.) when present and attach to BOTH kb_entry and reminder.
 
 PENDING REMINDER STATE: {pending_reminder}
 If there is a pending reminder, try to fill missing fields from the current message.
 
 RETURN ONLY VALID JSON (no markdown, no code fences):
 {{
-  "type": "kb" | "reminder" | "clarify" | "chat",
+  "type": "kb" | "reminder" | "both" | "clarify" | "chat",
   "kb_entry": {{
     "entity_type": "note" | "contact" | "order" | "fact",
     "entity_name": "string or null",
@@ -154,7 +158,7 @@ RETURN ONLY VALID JSON (no markdown, no code fences):
     "details": "the key information extracted"
   }} or null,
   "reminder": {{
-    "title": "short descriptive title",
+    "title": "short descriptive title or Reminder if none given",
     "due_datetime_local": "YYYY-MM-DDTHH:MM:SS",
     "order_ref": "string or null",
     "related_party": "string or null"
@@ -275,35 +279,70 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     saved_kb = None
     saved_reminder = None
 
-    if result_type == "kb" and extraction.get("kb_entry"):
-        kb = extraction["kb_entry"]
+    # Helper: save a KB entry
+    async def _save_kb(kb_data):
         entry = {
             "user_id": uid,
-            "entity_type": kb.get("entity_type", "note"),
-            "entity_name": kb.get("entity_name"),
-            "order_ref": kb.get("order_ref"),
-            "details": kb.get("details", body.message),
+            "entity_type": kb_data.get("entity_type", "note"),
+            "entity_name": kb_data.get("entity_name"),
+            "order_ref": kb_data.get("order_ref"),
+            "details": kb_data.get("details", body.message),
             "source_message": body.message,
         }
         rows = await db.insert("kb_entries", entry)
-        saved_kb = rows[0] if rows else entry
+        return rows[0] if rows else entry
 
-    elif result_type == "reminder" and extraction.get("reminder"):
-        rem = extraction["reminder"]
-        due_local = rem.get("due_datetime_local", "")
+    # Helper: save a reminder and build absolute confirmation text
+    async def _save_reminder(rem_data):
+        due_local = rem_data.get("due_datetime_local", "")
+        title = rem_data.get("title") or "Reminder"
         due_utc = local_to_utc(due_local, user_tz) if due_local else None
         rdata = {
             "user_id": uid,
-            "title": rem.get("title", ""),
+            "title": title,
             "due_datetime": due_utc,
             "timezone": user_tz,
-            "related_order_ref": rem.get("order_ref"),
-            "related_party": rem.get("related_party"),
+            "related_order_ref": rem_data.get("order_ref"),
+            "related_party": rem_data.get("related_party"),
             "status": "open",
             "source_message": body.message,
         }
         rows = await db.insert("reminders", rdata)
-        saved_reminder = rows[0] if rows else rdata
+        saved = rows[0] if rows else rdata
+        # Build absolute-time confirmation (Issue 3)
+        try:
+            dt_local = datetime.fromisoformat(due_local).replace(tzinfo=ZoneInfo(user_tz)) if due_local else None
+            if dt_local:
+                abs_str = dt_local.strftime("%b %-d, %Y at %-I:%M %p")
+                saved["_confirmation"] = f"Reminder created: {title} \u2014 {abs_str} ({user_tz})"
+        except Exception:
+            pass
+        return saved
+
+    # Process based on type
+    if result_type == "both":
+        # Mixed: save BOTH KB + reminder
+        if extraction.get("kb_entry"):
+            saved_kb = await _save_kb(extraction["kb_entry"])
+        if extraction.get("reminder"):
+            saved_reminder = await _save_reminder(extraction["reminder"])
+        # Build combined confirmation
+        parts = []
+        if saved_kb:
+            parts.append(f"Saved to Knowledge Base: {saved_kb.get('details', '')[:80]}")
+        if saved_reminder and saved_reminder.get("_confirmation"):
+            parts.append(saved_reminder["_confirmation"])
+        if parts:
+            response_text = " | ".join(parts)
+
+    elif result_type == "kb" and extraction.get("kb_entry"):
+        saved_kb = await _save_kb(extraction["kb_entry"])
+
+    elif result_type == "reminder" and extraction.get("reminder"):
+        saved_reminder = await _save_reminder(extraction["reminder"])
+        # Override response with absolute confirmation (Issue 3)
+        if saved_reminder and saved_reminder.get("_confirmation"):
+            response_text = saved_reminder["_confirmation"]
 
     # Save assistant message
     await db.insert("chat_messages", {"user_id": uid, "role": "assistant", "content": response_text})
