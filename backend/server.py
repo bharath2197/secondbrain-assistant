@@ -19,7 +19,6 @@ logger = logging.getLogger("server")
 
 # -----------------------------------------------------------------------------
 # App + CORS
-# Keep CORS middleware using env var CORS_ORIGINS (comma-separated) with fallback "*".
 # -----------------------------------------------------------------------------
 app = FastAPI()
 
@@ -47,7 +46,7 @@ SUPABASE_REST_URL = f"{SUPABASE_URL}/rest/v1" if SUPABASE_URL else ""
 SUPABASE_AUTH_URL = f"{SUPABASE_URL}/auth/v1" if SUPABASE_URL else ""
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = (os.getenv("GROQ_MODEL", "") or "").strip()  # strip whitespace/newlines
+GROQ_MODEL = (os.getenv("GROQ_MODEL", "") or "").strip()
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "America/Los_Angeles")
@@ -66,8 +65,9 @@ openai_client = AsyncOpenAI(api_key=GROQ_API_KEY, base_url=GROQ_BASE_URL)
 # -----------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
-    thread_id: Optional[str] = None  # accepted for compatibility, not stored (no column exists)
-    metadata: Dict[str, Any] = Field(default_factory=dict)  # accepted for compatibility, not stored
+    # Compatibility: frontend may send these even though DB table does not have them
+    thread_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatResponse(BaseModel):
@@ -77,27 +77,30 @@ class ChatResponse(BaseModel):
 
 class ProfileUpsertRequest(BaseModel):
     timezone: Optional[str] = None
+    # Compatibility: frontend may send display_name even though DB does not store it
+    display_name: Optional[str] = None
 
 
 class KbCreateRequest(BaseModel):
-    # Match actual columns for kb_entries
+    # Real columns
     entity_type: Optional[str] = None
     entity_name: Optional[str] = None
     order_ref: Optional[str] = None
     details: Optional[str] = None
     source_message: Optional[str] = None
 
-    # Compatibility fields (some frontends might still send these)
+    # Compatibility fields
     content: Optional[str] = None
 
 
 class ReminderCreateRequest(BaseModel):
     title: str
-    due_datetime: str  # ISO string with timezone offset preferred
+    due_datetime: str
     timezone: str
     related_order_ref: Optional[str] = None
     related_party: Optional[str] = None
     status: Optional[str] = "open"
+    emailed_at: Optional[str] = None
     notes: Optional[str] = None
     source_message: Optional[str] = None
 
@@ -122,7 +125,6 @@ def _require_groq() -> None:
 
 
 def _sb_headers(user_jwt: str) -> Dict[str, str]:
-    # Supabase REST style: pass user JWT, include anon key as apikey.
     return {
         "Authorization": f"Bearer {user_jwt}",
         "apikey": SUPABASE_ANON_KEY,
@@ -192,9 +194,9 @@ async def _sb_get_user(user_jwt: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Profile (table: user_profile)
-# Actual columns: id (uuid), created_at, user_email, timezone
-# Important bug fix based on your schema: the PK is id, not user_id.
+# Profile
+# Real columns: id (uuid), created_at, user_email, timezone
+# Note: user_profile uses id as the user id (not user_id).
 # -----------------------------------------------------------------------------
 async def _get_or_create_profile(user_jwt: str, user_id: str, user_email: str) -> Dict[str, Any]:
     resp = await _sb_request(
@@ -218,12 +220,7 @@ async def _get_or_create_profile(user_jwt: str, user_id: str, user_email: str) -
             prof["timezone"] = DEFAULT_TIMEZONE
         return prof
 
-    # Auto-create missing profile row
-    new_row = {
-        "id": user_id,
-        "user_email": user_email or "",
-        "timezone": DEFAULT_TIMEZONE,
-    }
+    new_row = {"id": user_id, "user_email": user_email or "", "timezone": DEFAULT_TIMEZONE}
     ins = await _sb_request(
         "POST",
         user_jwt,
@@ -260,8 +257,15 @@ async def _upsert_profile(user_jwt: str, user_id: str, user_email: str, patch: D
     return rows[0] if rows else await _get_or_create_profile(user_jwt, user_id, user_email)
 
 
+def _profile_response_with_compat(prof: Dict[str, Any]) -> Dict[str, Any]:
+    # Frontend compatibility: add display_name even though DB does not store it.
+    out = dict(prof)
+    out.setdefault("display_name", None)
+    return out
+
+
 # -----------------------------------------------------------------------------
-# Endpoints
+# Endpoints: Profile
 # -----------------------------------------------------------------------------
 @app.get("/api/profile")
 async def get_profile(authorization: str = Header(default="")):
@@ -271,10 +275,9 @@ async def get_profile(authorization: str = Header(default="")):
     user_email = user.get("email") or ""
 
     prof = await _get_or_create_profile(token, user_id, user_email)
-    return {"user": {"id": user_id, "email": user_email}, "profile": prof}
+    return {"user": {"id": user_id, "email": user_email}, "profile": _profile_response_with_compat(prof)}
 
 
-# Support both PATCH and POST to prevent 405 from mismatched frontend method.
 @app.patch("/api/profile")
 async def patch_profile(payload: ProfileUpsertRequest, authorization: str = Header(default="")):
     token = _extract_bearer_token(authorization)
@@ -288,15 +291,28 @@ async def patch_profile(payload: ProfileUpsertRequest, authorization: str = Head
 
     if not patch:
         prof = await _get_or_create_profile(token, user_id, user_email)
-        return {"profile": prof}
+        return {"profile": _profile_response_with_compat(prof)}
 
     prof = await _upsert_profile(token, user_id, user_email, patch)
-    return {"profile": prof}
+    return {"profile": _profile_response_with_compat(prof)}
 
 
 @app.post("/api/profile")
 async def post_profile(payload: ProfileUpsertRequest, authorization: str = Header(default="")):
+    # Avoid 405 if frontend uses POST.
     return await patch_profile(payload, authorization=authorization)
+
+
+# -----------------------------------------------------------------------------
+# Messages
+# Real columns: id, created_at, user_id, role, content
+# Frontend compatibility: return thread_id and metadata as null.
+# -----------------------------------------------------------------------------
+def _message_response_with_compat(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    out.setdefault("thread_id", None)
+    out.setdefault("metadata", None)
+    return out
 
 
 @app.get("/api/messages")
@@ -309,7 +325,6 @@ async def get_messages(
     user = await _sb_get_user(token)
     user_id = user["id"]
 
-    # Fetch desc then reverse to return ascending and remain robust after relogin
     resp = await _sb_request(
         "GET",
         token,
@@ -327,9 +342,18 @@ async def get_messages(
 
     rows = resp.json() or []
     rows.reverse()
-    return {"messages": rows}
+    return {"messages": [_message_response_with_compat(r) for r in rows]}
 
 
+# -----------------------------------------------------------------------------
+# Chat
+# Requirements:
+# - Insert user message into chat_messages
+# - Call Groq
+# - Insert assistant message into chat_messages
+# - Return reply
+# Note: thread_id and metadata are accepted but cannot be stored (no columns exist).
+# -----------------------------------------------------------------------------
 def _chat_system_prompt(timezone_name: str) -> str:
     return (
         "You are a helpful assistant.\n"
@@ -338,17 +362,8 @@ def _chat_system_prompt(timezone_name: str) -> str:
     )
 
 
-async def _insert_chat_message(
-    user_jwt: str,
-    user_id: str,
-    role: str,
-    content: str,
-) -> Dict[str, Any]:
-    row = {
-        "user_id": user_id,
-        "role": role,
-        "content": content,
-    }
+async def _insert_chat_message(user_jwt: str, user_id: str, role: str, content: str) -> Dict[str, Any]:
+    row = {"user_id": user_id, "role": role, "content": content}
     resp = await _sb_request(
         "POST",
         user_jwt,
@@ -359,7 +374,6 @@ async def _insert_chat_message(
     if resp.status_code >= 400:
         _log_supabase_failure(resp, f"INSERT chat_messages role={role}")
         raise HTTPException(status_code=500, detail="Failed to insert message")
-
     created = resp.json() or []
     return created[0] if created else row
 
@@ -401,7 +415,7 @@ async def chat(req: ChatRequest, authorization: str = Header(default="")):
     user_id = user["id"]
     user_email = user.get("email") or ""
 
-    # Ensure profile exists so timezone does not break chat
+    # Ensure profile exists so timezone reads do not break chat.
     prof = await _get_or_create_profile(token, user_id, user_email)
     tz_name = (prof.get("timezone") or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
 
@@ -409,10 +423,10 @@ async def chat(req: ChatRequest, authorization: str = Header(default="")):
     if not user_text:
         raise HTTPException(status_code=400, detail="Empty message")
 
-    # Insert user message into chat_messages
+    # 1) Insert user message
     await _insert_chat_message(token, user_id, "user", user_text)
 
-    # Load recent messages, call Groq
+    # 2) Call Groq
     history = await _load_recent_chat_messages(token, user_id, limit=30)
     groq_messages = [{"role": "system", "content": _chat_system_prompt(tz_name)}] + history
 
@@ -429,10 +443,22 @@ async def chat(req: ChatRequest, authorization: str = Header(default="")):
         logger.exception("Groq chat completion failed")
         raise HTTPException(status_code=500, detail=f"Groq error: {str(e)}")
 
-    # Insert assistant message into chat_messages
+    # 3) Insert assistant message
     await _insert_chat_message(token, user_id, "assistant", reply_text)
 
+    # 4) Return reply, echo thread_id for frontend compatibility
     return ChatResponse(reply=reply_text, thread_id=req.thread_id)
+
+
+# -----------------------------------------------------------------------------
+# KB
+# Real columns: id, created_at, user_id, entity_type, entity_name, order_ref, details, source_message
+# Compatibility: also expose "content" as alias of details for older UI code.
+# -----------------------------------------------------------------------------
+def _kb_response_with_compat(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    out.setdefault("content", out.get("details"))
+    return out
 
 
 @app.get("/api/kb")
@@ -456,7 +482,8 @@ async def get_kb(limit: int = 200, authorization: str = Header(default="")):
         _log_supabase_failure(resp, "SELECT kb_entries")
         raise HTTPException(status_code=500, detail="Failed to load KB")
 
-    return {"kb": resp.json() or []}
+    rows = resp.json() or []
+    return {"kb": [_kb_response_with_compat(r) for r in rows]}
 
 
 @app.post("/api/kb")
@@ -478,21 +505,21 @@ async def create_kb(payload: KbCreateRequest, authorization: str = Header(defaul
         "source_message": (payload.source_message or ""),
     }
 
-    resp = await _sb_request(
-        "POST",
-        token,
-        TABLE_KB,
-        json_body=[row],
-        prefer="return=representation",
-    )
+    resp = await _sb_request("POST", token, TABLE_KB, json_body=[row], prefer="return=representation")
     if resp.status_code >= 400:
         _log_supabase_failure(resp, "INSERT kb_entries")
         raise HTTPException(status_code=500, detail="Failed to create KB entry")
 
     created = resp.json() or []
-    return {"kb": created[0] if created else row}
+    created_row = created[0] if created else row
+    return {"kb": _kb_response_with_compat(created_row)}
 
 
+# -----------------------------------------------------------------------------
+# Reminders
+# Real columns: id, created_at, user_id, title, due_datetime, timezone, related_order_ref,
+# related_party, status, emailed_at, notes, source_message
+# -----------------------------------------------------------------------------
 @app.get("/api/reminders")
 async def get_reminders(
     limit: int = 500,
@@ -540,17 +567,12 @@ async def create_reminder(payload: ReminderCreateRequest, authorization: str = H
         "related_order_ref": payload.related_order_ref or "",
         "related_party": payload.related_party or "",
         "status": (payload.status or "open"),
+        "emailed_at": payload.emailed_at,
         "notes": payload.notes or "",
         "source_message": payload.source_message or "",
     }
 
-    resp = await _sb_request(
-        "POST",
-        token,
-        TABLE_REMINDERS,
-        json_body=[row],
-        prefer="return=representation",
-    )
+    resp = await _sb_request("POST", token, TABLE_REMINDERS, json_body=[row], prefer="return=representation")
     if resp.status_code >= 400:
         _log_supabase_failure(resp, "INSERT reminders")
         raise HTTPException(status_code=500, detail="Failed to create reminder")
@@ -559,11 +581,9 @@ async def create_reminder(payload: ReminderCreateRequest, authorization: str = H
     return {"reminder": created[0] if created else row}
 
 
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {
-        "ok": True,
-        "service": "secondbrain-backend",
-        "cors_origins": origins,
-        "groq_model": GROQ_MODEL,
-    }
+    return {"ok": True, "service": "secondbrain-backend", "cors_origins": origins, "groq_model": GROQ_MODEL}
