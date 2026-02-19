@@ -11,21 +11,34 @@ import jwt
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from openai import AsyncOpenAI
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-SUPABASE_URL = os.environ.get('SUPABASE_URL')
-SUPABASE_ANON_KEY = os.environ.get('SUPABASE_ANON_KEY')
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY environment variables")
+
+if not GROQ_API_KEY:
+    raise RuntimeError("Missing GROQ_API_KEY environment variable")
+
+groq_client = AsyncOpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1",
+)
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -134,7 +147,7 @@ User's default timezone: {timezone}
 RULES:
 1. If the message contains ONLY factual information (a fact, note, contact info, order details, preferences) with NO date/time/follow-up intent, classify as "kb".
 2. If the message mentions ONLY a future action, deadline, or follow-up with date/time intent, classify as "reminder".
-3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, you MUST classify as "both" and fill BOTH kb_entry AND reminder. Examples of mixed input: "PO 600 shipment delayed due to weather. Follow up Friday at 2 PM." — the factual update is kb_entry, the follow-up is a reminder.
+3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, you MUST classify as "both" and fill BOTH kb_entry AND reminder. Examples of mixed input: "PO 600 shipment delayed due to weather. Follow up Friday at 2 PM." the factual update is kb_entry, the follow-up is a reminder.
 4. If a reminder is being built (see PENDING STATE) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
 5. For general conversation or greetings, classify as "chat".
 
@@ -184,16 +197,10 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
     system_msg = EXTRACTION_PROMPT.format(
         now=now_str,
         timezone=user_tz,
-        pending_reminder=json.dumps(pending) if pending else "None"
+        pending_reminder=json.dumps(pending) if pending else "None",
     )
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=f"extract-{uuid.uuid4()}",
-        system_message=system_msg
-    ).with_model("openai", "gpt-4o")
-
-    parts = []
+    parts: List[str] = []
     if recent:
         parts.append("Recent conversation:")
         for m in recent[-6:]:
@@ -201,12 +208,30 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
         parts.append("")
     parts.append(f"User says: {message}")
 
-    response = await chat.send_message(UserMessage(text="\n".join(parts)))
+    llm_input = system_msg + "\n\n" + "\n".join(parts)
+
+    try:
+        resp = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": llm_input}],
+            temperature=0.2,
+        )
+        response = resp.choices[0].message.content or ""
+    except Exception:
+        logger.exception("Groq call failed")
+        return {
+            "type": "chat",
+            "kb_entry": None,
+            "reminder": None,
+            "clarify_question": None,
+            "updated_pending": None,
+            "response": "LLM failed. Please try again.",
+        }
 
     try:
         return json.loads(response)
     except json.JSONDecodeError:
-        m = re.search(r'\{[\s\S]*\}', response)
+        m = re.search(r"\{[\s\S]*\}", response)
         if m:
             try:
                 return json.loads(m.group())
@@ -218,7 +243,7 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
             "reminder": None,
             "clarify_question": None,
             "updated_pending": None,
-            "response": response
+            "response": response,
         }
 
 
@@ -226,7 +251,7 @@ def local_to_utc(local_dt_str: str, tz_str: str) -> str:
     local_dt = datetime.fromisoformat(local_dt_str)
     if local_dt.tzinfo is None:
         local_dt = local_dt.replace(tzinfo=ZoneInfo(tz_str))
-    return local_dt.astimezone(ZoneInfo('UTC')).isoformat()
+    return local_dt.astimezone(ZoneInfo("UTC")).isoformat()
 
 
 # ---- API Endpoints ----
@@ -263,11 +288,14 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     user_tz = profiles[0]["timezone"] if profiles else "UTC"
 
     # Recent messages for context
-    recent = await db.select("chat_messages", {
-        "user_id": f"eq.{uid}",
-        "order": "created_at.desc",
-        "limit": "10"
-    })
+    recent = await db.select(
+        "chat_messages",
+        {
+            "user_id": f"eq.{uid}",
+            "order": "created_at.desc",
+            "limit": "10",
+        },
+    )
     recent.reverse()
 
     # Save user message
@@ -275,8 +303,10 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
     # LLM extraction
     extraction = await extract_message(
-        body.message, user_tz, body.pending_reminder,
-        [{"role": m["role"], "content": m["content"]} for m in recent]
+        body.message,
+        user_tz,
+        body.pending_reminder,
+        [{"role": m["role"], "content": m["content"]} for m in recent],
     )
 
     result_type = extraction.get("type", "chat")
@@ -307,9 +337,10 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     async def _save_reminder(rem_data):
         due_local = rem_data.get("due_datetime_local", "")
         title = rem_data.get("title") or "Reminder"
-        # Issue 1: Use explicit timezone from LLM if provided, else fall back to profile
+
         explicit_tz = rem_data.get("timezone")
         eff_tz = explicit_tz if explicit_tz else user_tz
+
         due_utc = local_to_utc(due_local, eff_tz) if due_local else None
         rdata = {
             "user_id": uid,
@@ -323,37 +354,37 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         }
         rows = await db.insert("reminders", rdata)
         saved = rows[0] if rows else rdata
+
         try:
             dt_local = datetime.fromisoformat(due_local).replace(tzinfo=ZoneInfo(eff_tz)) if due_local else None
             if dt_local:
                 abs_str = dt_local.strftime("%b %-d, %Y at %-I:%M %p")
-                saved["_confirmation"] = f"Reminder created: {title} \u2014 {abs_str} ({eff_tz})"
+                saved["_confirmation"] = f"Reminder created: {title} - {abs_str} ({eff_tz})"
         except Exception:
             pass
+
         return saved
 
     # Process based on type
     if result_type == "both":
-        # Mixed: save BOTH KB + reminder
         if extraction.get("kb_entry"):
             saved_kb = await _save_kb(extraction["kb_entry"])
         if extraction.get("reminder"):
             saved_reminder = await _save_reminder(extraction["reminder"])
-        # Build combined confirmation
-        parts = []
+
+        parts2 = []
         if saved_kb:
-            parts.append(f"Saved to Knowledge Base: {saved_kb.get('details', '')[:80]}")
+            parts2.append(f"Saved to Knowledge Base: {saved_kb.get('details', '')[:80]}")
         if saved_reminder and saved_reminder.get("_confirmation"):
-            parts.append(saved_reminder["_confirmation"])
-        if parts:
-            response_text = " | ".join(parts)
+            parts2.append(saved_reminder["_confirmation"])
+        if parts2:
+            response_text = " | ".join(parts2)
 
     elif result_type == "kb" and extraction.get("kb_entry"):
         saved_kb = await _save_kb(extraction["kb_entry"])
 
     elif result_type == "reminder" and extraction.get("reminder"):
         saved_reminder = await _save_reminder(extraction["reminder"])
-        # Override response with absolute confirmation (Issue 3)
         if saved_reminder and saved_reminder.get("_confirmation"):
             response_text = saved_reminder["_confirmation"]
 
@@ -374,11 +405,14 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 async def get_messages(request: Request, limit: int = 50):
     db = get_db(request)
     uid = get_user_id(request)
-    return await db.select("chat_messages", {
-        "user_id": f"eq.{uid}",
-        "order": "created_at.asc",
-        "limit": str(limit),
-    })
+    return await db.select(
+        "chat_messages",
+        {
+            "user_id": f"eq.{uid}",
+            "order": "created_at.asc",
+            "limit": str(limit),
+        },
+    )
 
 
 @api_router.get("/kb")
@@ -424,7 +458,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
