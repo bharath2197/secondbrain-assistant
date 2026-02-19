@@ -10,8 +10,10 @@ import jwt
 from pathlib import Path
 from pydantic import BaseModel
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import smtplib
+from email.message import EmailMessage
 
 # We use OpenAI SDK with Groq OpenAI-compatible endpoint
 from openai import AsyncOpenAI
@@ -24,6 +26,23 @@ SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()  # strip whitespace/newlines
+
+# Email dispatch env
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT") or "587")
+SMTP_USER = os.environ.get("SMTP_USER")
+SMTP_PASS = os.environ.get("SMTP_PASS")
+FROM_EMAIL = os.environ.get("FROM_EMAIL") or (SMTP_USER or "")
+DISPATCH_SECRET = os.environ.get("DISPATCH_SECRET")  # required for cron endpoint
+
+# Daily summary time (local)
+DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR") or "8")
+DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE") or "0")
+DAILY_SUMMARY_WINDOW_MINUTES = int(os.environ.get("DAILY_SUMMARY_WINDOW_MINUTES") or "5")
+
+# Due send window
+DUE_EARLY_WINDOW_HOURS = int(os.environ.get("DUE_EARLY_WINDOW_HOURS") or "2")
+DUE_LATE_GRACE_MINUTES = int(os.environ.get("DUE_LATE_GRACE_MINUTES") or "5")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars")
@@ -100,7 +119,6 @@ class SupabaseREST:
                 logger.error(f"Supabase DELETE {table}: {r.status_code} {r.text}")
                 raise HTTPException(status_code=r.status_code, detail=r.text)
 
-
 # -----------------------------
 # Auth helpers
 # -----------------------------
@@ -129,6 +147,16 @@ def get_user_id(request: Request) -> str:
 def get_db(request: Request) -> SupabaseREST:
     return SupabaseREST(get_token(request))
 
+# -----------------------------
+# Service-role Supabase client for cron job
+# -----------------------------
+def get_service_db() -> SupabaseREST:
+    """
+    For cron job: use service role key if available, otherwise anon.
+    This endpoint should not rely on end-user JWT.
+    """
+    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or SUPABASE_ANON_KEY
+    return SupabaseREST(service_key)
 
 # -----------------------------
 # Request models
@@ -144,7 +172,6 @@ class ProfileUpdate(BaseModel):
 
 class ReminderStatusUpdate(BaseModel):
     status: str
-
 
 # -----------------------------
 # Date parsing (server-side)
@@ -186,10 +213,6 @@ THIS_NEXT_DOW_RE = re.compile(
 )
 
 def _parse_time_from_text_strict(text: str) -> Optional[Tuple[int, int]]:
-    """
-    Bug fix 1: strict time parsing.
-    Returns (hour24, minute) only if text contains an explicit time.
-    """
     m24 = TIME_24H_STRICT_RE.search(text)
     if m24:
         h = int(m24.group("h"))
@@ -212,15 +235,10 @@ def _parse_time_from_text_strict(text: str) -> Optional[Tuple[int, int]]:
     return (h, minute)
 
 def _next_weekday(base: datetime, weekday: int) -> datetime:
-    """Next occurrence of weekday (could be today if same weekday)."""
     days_ahead = (weekday - base.weekday()) % 7
     return base + timedelta(days=days_ahead)
 
 def _extract_hour_min_from_pending(pending: Optional[Dict[str, Any]], user_tz: str) -> Optional[Tuple[int, int]]:
-    """
-    Bug fix 3: pending reminder carry-over.
-    If pending_reminder has due_datetime_local, reuse its hour/minute when user provides a day but no time.
-    """
     if not pending or not isinstance(pending, dict):
         return None
     dt_str = pending.get("due_datetime_local")
@@ -228,23 +246,13 @@ def _extract_hour_min_from_pending(pending: Optional[Dict[str, Any]], user_tz: s
         return None
     try:
         dt = datetime.fromisoformat(dt_str)
-        # pending is stored as local naive in this app
         if dt.tzinfo is None:
-            # treat as user local
             dt = dt.replace(tzinfo=ZoneInfo(user_tz))
         return (dt.hour, dt.minute)
     except Exception:
         return None
 
 def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """
-    Deterministic parser for key cases:
-    - "in 2 weeks", "in 10 days"
-    - "Friday at 3pm", "this Friday 3pm", "next Friday 3pm"
-    Defaults time to 09:00 if missing, except:
-      Bug fix 3: if pending_reminder has a prior due_datetime_local, reuse its hour/minute when user gives a weekday without time.
-    Returns ISO local naive string: YYYY-MM-DDTHH:MM:SS
-    """
     text = message.strip().lower()
     now_local = datetime.now(ZoneInfo(user_tz))
 
@@ -259,7 +267,6 @@ def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional
             return carry_time
         return default_time
 
-    # in N weeks
     m = IN_WEEKS_RE.search(text)
     if m:
         n = int(m.group("n"))
@@ -268,7 +275,6 @@ def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional
         target = target.replace(hour=hr_min[0], minute=hr_min[1], second=0, microsecond=0)
         return target.replace(tzinfo=None).isoformat()
 
-    # in N days
     m = IN_DAYS_RE.search(text)
     if m:
         n = int(m.group("n"))
@@ -277,7 +283,6 @@ def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional
         target = target.replace(hour=hr_min[0], minute=hr_min[1], second=0, microsecond=0)
         return target.replace(tzinfo=None).isoformat()
 
-    # weekday patterns
     m = THIS_NEXT_DOW_RE.search(text)
     if m:
         prefix = (m.group("prefix") or "").lower()
@@ -290,7 +295,6 @@ def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional
         base_date = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         upcoming = _next_weekday(base_date, weekday)
 
-        # "next Friday" means next week's Friday
         if prefix == "next":
             upcoming = upcoming + timedelta(days=7)
 
@@ -300,13 +304,11 @@ def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional
 
     return None
 
-
 def local_to_utc(local_dt_str: str, tz_str: str) -> str:
     local_dt = datetime.fromisoformat(local_dt_str)
     if local_dt.tzinfo is None:
         local_dt = local_dt.replace(tzinfo=ZoneInfo(tz_str))
     return local_dt.astimezone(ZoneInfo("UTC")).isoformat()
-
 
 # -----------------------------
 # LLM Extraction (Groq)
@@ -419,6 +421,49 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
             "response": "LLM failed. Please try again.",
         }
 
+# -----------------------------
+# Email helpers
+# -----------------------------
+def _smtp_ready() -> bool:
+    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and FROM_EMAIL)
+
+def send_email(to_email: str, subject: str, body: str) -> None:
+    """
+    Free beta approach: Gmail SMTP with App Password.
+    Raises on failure. Caller controls retries and DB updates.
+    """
+    if not _smtp_ready():
+        raise RuntimeError("SMTP not configured. Set SMTP_HOST/PORT/USER/PASS and FROM_EMAIL.")
+
+    msg = EmailMessage()
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.ehlo()
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+def fmt_local(dt_utc: datetime, tz_str: str) -> str:
+    dt_local = dt_utc.astimezone(ZoneInfo(tz_str))
+    return dt_local.strftime("%b %-d, %Y at %-I:%M %p")
+
+def _parse_supabase_timestamptz(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    s = str(value).strip()
+    try:
+        # Supabase tends to return "YYYY-MM-DD HH:MM:SS+00"
+        s = s.replace(" ", "T")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
 
 # -----------------------------
 # API Endpoints
@@ -427,14 +472,12 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
 async def root():
     return {"status": "ok", "service": "SecondBrain API"}
 
-
 @api_router.get("/profile")
 async def get_profile(request: Request):
     db = get_db(request)
     uid = get_user_id(request)
     rows = await db.select("user_profile", {"id": f"eq.{uid}"})
     return rows[0] if rows else None
-
 
 @api_router.post("/profile")
 async def upsert_profile(body: ProfileUpdate, request: Request):
@@ -445,32 +488,26 @@ async def upsert_profile(body: ProfileUpdate, request: Request):
     result = await db.upsert("user_profile", data, on_conflict="id")
     return result[0] if result else data
 
-# Optional: some frontends call PATCH
 @api_router.patch("/profile")
 async def patch_profile(body: ProfileUpdate, request: Request):
     return await upsert_profile(body, request)
-
 
 @api_router.post("/chat")
 async def chat_endpoint(body: ChatRequest, request: Request):
     db = get_db(request)
     uid = get_user_id(request)
 
-    # Get timezone (auto-default to UTC if missing row)
     profiles = await db.select("user_profile", {"id": f"eq.{uid}"})
     user_tz = profiles[0]["timezone"] if profiles and profiles[0].get("timezone") else "UTC"
 
-    # Recent messages for context
     recent = await db.select(
         "chat_messages",
         {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": "10"},
     )
     recent.reverse()
 
-    # Save user message
     await db.insert("chat_messages", {"user_id": uid, "role": "user", "content": body.message})
 
-    # LLM extraction
     extraction = await extract_message(
         body.message,
         user_tz,
@@ -483,8 +520,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     saved_kb = None
     saved_reminder = None
 
-    # Bug fix 2: If LLM returns clarify but server can resolve a due datetime, override clarify and create reminder.
-    # Also used to enforce deterministic parsing for relative dates/times.
     def _forced_due_from_server() -> Optional[str]:
         return _resolve_relative_due_datetime(body.message, user_tz, pending=body.pending_reminder)
 
@@ -496,7 +531,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             rem = {**rem, "due_datetime_local": forced}
         return rem
 
-    # Treat inconsistent LLM outputs as "both"
     if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
         result_type = "both"
     if result_type == "kb" and extraction.get("reminder") and extraction.get("kb_entry"):
@@ -524,7 +558,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         eff_tz = explicit_tz if explicit_tz else user_tz
 
         if not due_local:
-            # Last chance: server-side forced parse using pending carry-over (bug fix 3)
             forced = _forced_due_from_server()
             if forced:
                 due_local = forced
@@ -547,7 +580,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         rows = await db.insert("reminders", rdata)
         saved = rows[0] if rows else rdata
 
-        # absolute confirmation text (format must remain)
         try:
             dt_local = datetime.fromisoformat(due_local).replace(tzinfo=ZoneInfo(eff_tz))
             abs_str = dt_local.strftime("%b %-d, %Y at %-I:%M %p")
@@ -557,18 +589,14 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
         return saved
 
-    # Bug fix 2: override clarify if server can resolve due datetime.
     if result_type == "clarify":
         forced_due = _forced_due_from_server()
         if forced_due:
-            # Build reminder payload from whatever we have
             base_rem = extraction.get("reminder") or {}
             if not isinstance(base_rem, dict):
                 base_rem = {}
-            # If LLM didn't provide reminder, try to use updated_pending
             if not base_rem and isinstance(extraction.get("updated_pending"), dict):
                 base_rem = dict(extraction["updated_pending"])
-            # Carry over a title if present in pending
             if body.pending_reminder and isinstance(body.pending_reminder, dict):
                 if body.pending_reminder.get("title") and not base_rem.get("title"):
                     base_rem["title"] = body.pending_reminder.get("title")
@@ -580,10 +608,8 @@ async def chat_endpoint(body: ChatRequest, request: Request):
                 response_text = saved_reminder["_confirmation"]
             result_type = "reminder"
         else:
-            # keep clarify behavior
             response_text = extraction.get("clarify_question") or response_text
 
-    # Process non-clarify
     if result_type == "both":
         if extraction.get("kb_entry"):
             saved_kb = await _save_kb(extraction["kb_entry"])
@@ -606,7 +632,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         if saved_reminder and saved_reminder.get("_confirmation"):
             response_text = saved_reminder["_confirmation"]
 
-    # Save assistant message
     await db.insert("chat_messages", {"user_id": uid, "role": "assistant", "content": response_text})
 
     return {
@@ -618,20 +643,17 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         "updated_pending": extraction.get("updated_pending"),
     }
 
-
 @api_router.get("/messages")
 async def get_messages(request: Request, limit: int = 200):
     db = get_db(request)
     uid = get_user_id(request)
 
-    # fetch newest first then reverse so UI shows chronological
     rows = await db.select(
         "chat_messages",
         {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": str(limit)},
     )
     rows.reverse()
     return rows
-
 
 @api_router.get("/kb")
 async def get_kb(request: Request, entity_type: str = None, search: str = None):
@@ -644,14 +666,12 @@ async def get_kb(request: Request, entity_type: str = None, search: str = None):
         params["or"] = f"(details.ilike.%{search}%,entity_name.ilike.%{search}%,order_ref.ilike.%{search}%)"
     return await db.select("kb_entries", params)
 
-
 @api_router.delete("/kb/{entry_id}")
 async def delete_kb(entry_id: str, request: Request):
     db = get_db(request)
     uid = get_user_id(request)
     await db.delete("kb_entries", {"id": entry_id, "user_id": uid})
     return {"ok": True}
-
 
 @api_router.get("/reminders")
 async def get_reminders(request: Request, status: str = None):
@@ -662,7 +682,6 @@ async def get_reminders(request: Request, status: str = None):
         params["status"] = f"eq.{status}"
     return await db.select("reminders", params)
 
-
 @api_router.patch("/reminders/{reminder_id}")
 async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request: Request):
     db = get_db(request)
@@ -670,6 +689,206 @@ async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request:
     result = await db.update("reminders", {"status": body.status}, {"id": reminder_id, "user_id": uid})
     return result[0] if result else {"ok": True}
 
+# -----------------------------
+# Cron endpoint: dispatch emails
+# -----------------------------
+@api_router.post("/dispatch-emails")
+async def dispatch_emails(request: Request):
+    """
+    Called by Render Cron Job every 5 minutes.
+    Security: requires X-Dispatch-Secret header to match DISPATCH_SECRET.
+    Sends:
+      1) Due emails within [due-2h, due+5m] for open reminders (once)
+      2) Daily summary at 08:00 local time (once per day per user)
+    """
+    secret = request.headers.get("X-Dispatch-Secret", "")
+    if not DISPATCH_SECRET or secret != DISPATCH_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not _smtp_ready():
+        raise HTTPException(status_code=500, detail="SMTP not configured")
+
+    db = get_service_db()
+    now_utc = datetime.now(timezone.utc)
+
+    sent_due = 0
+    sent_daily = 0
+    checked_reminders = 0
+    checked_users = 0
+
+    # Fetch users (id, user_email, timezone, last_daily_email_at)
+    # NOTE: your user_profile table columns include id, user_email, timezone, and we add last_daily_email_at.
+    users = await db.select(
+        "user_profile",
+        {
+            "select": "id,user_email,timezone,last_daily_email_at",
+            "user_email": "not.is.null",
+            "timezone": "not.is.null",
+            "limit": "1000",
+        },
+    )
+
+    for u in users:
+        checked_users += 1
+        user_id = u.get("id")
+        user_email = (u.get("user_email") or "").strip()
+        tz_str = (u.get("timezone") or "").strip()
+        if not user_id or not user_email or not tz_str:
+            continue
+
+        # 1) DUE EMAILS for this user
+        # Fetch open reminders not yet emailed due (limit to keep runs bounded)
+        reminders = await db.select(
+            "reminders",
+            {
+                "select": "id,title,due_datetime,timezone,status,emailed_due_at",
+                "user_id": f"eq.{user_id}",
+                "status": "eq.open",
+                "emailed_due_at": "is.null",
+                "order": "due_datetime.asc",
+                "limit": "200",
+            },
+        )
+
+        for r in reminders:
+            checked_reminders += 1
+            rid = r.get("id")
+            title = (r.get("title") or "Reminder").strip()
+            due_utc = _parse_supabase_timestamptz(r.get("due_datetime"))
+            if not rid or not due_utc:
+                continue
+
+            window_start = due_utc - timedelta(hours=DUE_EARLY_WINDOW_HOURS)
+            window_end = due_utc + timedelta(minutes=DUE_LATE_GRACE_MINUTES)
+
+            # Outside allowed send window
+            if now_utc < window_start:
+                continue
+            if now_utc > window_end:
+                # Bug-proof behavior: skip late reminders permanently by NOT sending
+                # We leave emailed_due_at null so you can inspect them later.
+                continue
+
+            # Send email and then mark emailed_due_at (idempotent)
+            display_tz = (r.get("timezone") or tz_str).strip() or tz_str
+            subject = f"Reminder: {title}"
+            body = (
+                f"Hi,\n\n"
+                f"This is your reminder:\n"
+                f"- {title}\n\n"
+                f"Scheduled time:\n"
+                f"- {fmt_local(due_utc, display_tz)} ({display_tz})\n\n"
+                f"SecondBrain"
+            )
+            try:
+                send_email(user_email, subject, body)
+                await db.update("reminders", {"emailed_due_at": now_utc.isoformat()}, {"id": rid})
+                sent_due += 1
+            except Exception:
+                logger.exception(f"Failed sending due email user_id={user_id} reminder_id={rid}")
+                # Do not set emailed_due_at on failure
+
+        # 2) DAILY SUMMARY at 08:00 local (once/day)
+        try:
+            user_now_local = now_utc.astimezone(ZoneInfo(tz_str))
+        except Exception:
+            continue
+
+        # Only run summary inside a small window after 08:00
+        summary_start = user_now_local.replace(
+            hour=DAILY_SUMMARY_HOUR,
+            minute=DAILY_SUMMARY_MINUTE,
+            second=0,
+            microsecond=0,
+        )
+        summary_end = summary_start + timedelta(minutes=DAILY_SUMMARY_WINDOW_MINUTES)
+
+        if not (summary_start <= user_now_local < summary_end):
+            continue
+
+        last_daily = _parse_supabase_timestamptz(u.get("last_daily_email_at"))
+        if last_daily:
+            last_local_date = last_daily.astimezone(ZoneInfo(tz_str)).date()
+            if last_local_date == user_now_local.date():
+                continue
+
+        # Build today's UTC range based on user's local date
+        start_of_day_local = user_now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_next_day_local = start_of_day_local + timedelta(days=1)
+        start_utc = start_of_day_local.astimezone(timezone.utc)
+        end_utc = start_of_next_day_local.astimezone(timezone.utc)
+
+        todays = await db.select(
+            "reminders",
+            {
+                "select": "title,due_datetime,timezone,status",
+                "user_id": f"eq.{user_id}",
+                "status": "eq.open",
+                "due_datetime": f"gte.{start_utc.isoformat()}",
+                "due_datetime": f"lt.{end_utc.isoformat()}",
+                "order": "due_datetime.asc",
+                "limit": "200",
+            },
+        )
+        # NOTE: Supabase REST cannot accept duplicate keys in dict. So we do OR via manual query below if needed.
+        # Workaround: fetch broader range by day using 'and' style is tricky in dict.
+        # We'll instead fetch open reminders and filter in code for correctness.
+
+        # Re-fetch open reminders and filter locally to avoid duplicate query param keys issue.
+        open_all = await db.select(
+            "reminders",
+            {
+                "select": "title,due_datetime,timezone,status",
+                "user_id": f"eq.{user_id}",
+                "status": "eq.open",
+                "order": "due_datetime.asc",
+                "limit": "500",
+            },
+        )
+
+        items: List[str] = []
+        for rr in open_all:
+            dtu = _parse_supabase_timestamptz(rr.get("due_datetime"))
+            if not dtu:
+                continue
+            if not (start_utc <= dtu < end_utc):
+                continue
+            title2 = (rr.get("title") or "Reminder").strip()
+            display_tz2 = (rr.get("timezone") or tz_str).strip() or tz_str
+            time_str = dtu.astimezone(ZoneInfo(display_tz2)).strftime("%-I:%M %p")
+            items.append(f"- {time_str} — {title2}")
+
+        if not items:
+            summary_body = (
+                "Hi,\n\n"
+                "Good morning.\n\n"
+                "You have no reminders scheduled for today.\n\n"
+                "SecondBrain"
+            )
+        else:
+            summary_body = (
+                "Hi,\n\n"
+                "Good morning.\n\n"
+                "Here are your reminders for today:\n\n"
+                + "\n".join(items)
+                + "\n\nSecondBrain"
+            )
+
+        try:
+            send_email(user_email, "Your reminders for today", summary_body)
+            await db.update("user_profile", {"last_daily_email_at": now_utc.isoformat()}, {"id": user_id})
+            sent_daily += 1
+        except Exception:
+            logger.exception(f"Failed sending daily summary user_id={user_id}")
+
+    return {
+        "ok": True,
+        "sent_due": sent_due,
+        "sent_daily": sent_daily,
+        "checked_users": checked_users,
+        "checked_reminders": checked_reminders,
+        "now_utc": now_utc.isoformat(),
+    }
 
 # -----------------------------
 # Middleware & startup
