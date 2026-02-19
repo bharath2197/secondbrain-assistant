@@ -301,12 +301,15 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     async def _save_reminder(rem_data):
         due_local = rem_data.get("due_datetime_local", "")
         title = rem_data.get("title") or "Reminder"
-        due_utc = local_to_utc(due_local, user_tz) if due_local else None
+        # Issue 1: Use explicit timezone from LLM if provided, else fall back to profile
+        explicit_tz = rem_data.get("timezone")
+        eff_tz = explicit_tz if explicit_tz else user_tz
+        due_utc = local_to_utc(due_local, eff_tz) if due_local else None
         rdata = {
             "user_id": uid,
             "title": title,
             "due_datetime": due_utc,
-            "timezone": user_tz,
+            "timezone": eff_tz,
             "related_order_ref": rem_data.get("order_ref"),
             "related_party": rem_data.get("related_party"),
             "status": "open",
@@ -314,12 +317,11 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         }
         rows = await db.insert("reminders", rdata)
         saved = rows[0] if rows else rdata
-        # Build absolute-time confirmation (Issue 3)
         try:
-            dt_local = datetime.fromisoformat(due_local).replace(tzinfo=ZoneInfo(user_tz)) if due_local else None
+            dt_local = datetime.fromisoformat(due_local).replace(tzinfo=ZoneInfo(eff_tz)) if due_local else None
             if dt_local:
                 abs_str = dt_local.strftime("%b %-d, %Y at %-I:%M %p")
-                saved["_confirmation"] = f"Reminder created: {title} \u2014 {abs_str} ({user_tz})"
+                saved["_confirmation"] = f"Reminder created: {title} \u2014 {abs_str} ({eff_tz})"
         except Exception:
             pass
         return saved
