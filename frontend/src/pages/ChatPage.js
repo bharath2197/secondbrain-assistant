@@ -75,6 +75,9 @@ export default function ChatPage() {
 
       if (data.type === 'kb') toast.success('Saved to Knowledge Base');
       if (data.type === 'reminder') toast.success('Reminder created');
+      if (data.type === 'both') {
+        toast.success('Saved to KB + Reminder created');
+      }
 
       const autoSpeak = localStorage.getItem('autoSpeak') === 'true';
       if (autoSpeak && data.response && data.response.length < 200) {
@@ -156,6 +159,7 @@ export default function ChatPage() {
               {msg.content}
               {msg._type === 'kb' && <div><span className="badge-kb">Saved to KB</span></div>}
               {msg._type === 'reminder' && <div><span className="badge-reminder">Reminder Set</span></div>}
+              {msg._type === 'both' && <div><span className="badge-kb">Saved to KB</span>{' '}<span className="badge-reminder">Reminder Set</span></div>}
             </div>
             {msg.role === 'assistant' && (
               <button
