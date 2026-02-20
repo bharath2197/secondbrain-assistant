@@ -12,27 +12,29 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-import smtplib
-from email.message import EmailMessage
 
-# We use OpenAI SDK with Groq OpenAI-compatible endpoint
+# Groq OpenAI-compatible endpoint
 from openai import AsyncOpenAI
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
+# -----------------------------
+# Env
+# -----------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
-# Email dispatch env
-SMTP_HOST = os.environ.get("SMTP_HOST")
-SMTP_PORT = int(os.environ.get("SMTP_PORT") or "587")
-SMTP_USER = os.environ.get("SMTP_USER")
-SMTP_PASS = os.environ.get("SMTP_PASS")
-FROM_EMAIL = os.environ.get("FROM_EMAIL") or (SMTP_USER or "")
+# Email (Resend)
+EMAIL_PROVIDER = (os.environ.get("EMAIL_PROVIDER") or "resend").strip().lower()
+RESEND_API_KEY = (os.environ.get("RESEND_API_KEY") or "").strip()
+FROM_EMAIL = (os.environ.get("FROM_EMAIL") or "").strip()
+
+# Cron security
 DISPATCH_SECRET = os.environ.get("DISPATCH_SECRET")  # required for cron endpoint
 
 # Daily summary time (local)
@@ -40,9 +42,9 @@ DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR") or "8")
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE") or "0")
 DAILY_SUMMARY_WINDOW_MINUTES = int(os.environ.get("DAILY_SUMMARY_WINDOW_MINUTES") or "5")
 
-# Due send window: send ONCE within [-2h, +2h]
-DUE_WINDOW_BEFORE_HOURS = int(os.environ.get("DUE_WINDOW_BEFORE_HOURS") or "2")
-DUE_WINDOW_AFTER_HOURS = int(os.environ.get("DUE_WINDOW_AFTER_HOURS") or "2")
+# Due send window (recommended for cron every 5 min)
+DUE_EARLY_WINDOW_HOURS = int(os.environ.get("DUE_EARLY_WINDOW_HOURS") or "2")
+DUE_LATE_GRACE_MINUTES = int(os.environ.get("DUE_LATE_GRACE_MINUTES") or "5")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars")
@@ -68,15 +70,15 @@ if GROQ_API_KEY:
 # -----------------------------
 class SupabaseREST:
     """
-    IMPORTANT FIX:
-    apikey header must match the token you use (anon vs service role),
-    otherwise you can get weird auth/RLS behavior.
+    token is a Supabase JWT (anon/service_role/user JWT).
+    For Supabase REST:
+      - apikey: use anon/service_role key
+      - Authorization: Bearer <JWT>
     """
-    def __init__(self, token: str, apikey: Optional[str] = None):
+    def __init__(self, token: str, apikey: str):
         self.base = f"{SUPABASE_URL}/rest/v1"
-        key = apikey or SUPABASE_ANON_KEY
         self.headers = {
-            "apikey": key,
+            "apikey": apikey,
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
@@ -151,14 +153,17 @@ def get_user_id(request: Request) -> str:
 
 
 def get_db(request: Request) -> SupabaseREST:
-    # End-user requests: anon apikey + user's JWT as Bearer
-    return SupabaseREST(get_token(request), apikey=SUPABASE_ANON_KEY)
+    token = get_token(request)  # end-user JWT
+    return SupabaseREST(token=token, apikey=SUPABASE_ANON_KEY)
 
 
 def get_service_db() -> SupabaseREST:
-    # Cron job: service role key for both apikey + Bearer token
-    service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or SUPABASE_ANON_KEY
-    return SupabaseREST(service_key, apikey=service_key)
+    """
+    For cron job: use service role key if available, otherwise anon.
+    IMPORTANT: service role must be used for BOTH apikey and bearer token.
+    """
+    key = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_ANON_KEY
+    return SupabaseREST(token=key, apikey=key)
 
 # -----------------------------
 # Request models
@@ -188,15 +193,10 @@ WEEKDAYS = {
     "sunday": 6, "sun": 6,
 }
 
-TIME_12H_STRICT_RE = re.compile(
-    r"\b(?P<h>1[0-2]|0?[1-9])(?::(?P<m>[0-5]\d))?\s*(?P<ampm>am|pm)\b",
-    re.IGNORECASE
-)
+TIME_12H_STRICT_RE = re.compile(r"\b(?P<h>1[0-2]|0?[1-9])(?::(?P<m>[0-5]\d))?\s*(?P<ampm>am|pm)\b", re.IGNORECASE)
 TIME_24H_STRICT_RE = re.compile(r"\b(?P<h>[01]?\d|2[0-3]):(?P<m>[0-5]\d)\b")
-
 IN_WEEKS_RE = re.compile(r"\bin\s+(?P<n>\d+)\s+weeks?\b", re.IGNORECASE)
 IN_DAYS_RE = re.compile(r"\bin\s+(?P<n>\d+)\s+days?\b", re.IGNORECASE)
-
 THIS_NEXT_DOW_RE = re.compile(
     r"\b(?:(?P<prefix>this|next)\s+)?(?P<dow>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday|r|rday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
     re.IGNORECASE,
@@ -219,7 +219,6 @@ def _parse_time_from_text_strict(text: str) -> Optional[Tuple[int, int]]:
         h = 0
     if ampm == "pm":
         h += 12
-
     return (h, minute)
 
 def _next_weekday(base: datetime, weekday: int) -> datetime:
@@ -282,7 +281,6 @@ def _resolve_relative_due_datetime(message: str, user_tz: str, pending: Optional
 
         base_date = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         upcoming = _next_weekday(base_date, weekday)
-
         if prefix == "next":
             upcoming = upcoming + timedelta(days=7)
 
@@ -410,26 +408,32 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
         }
 
 # -----------------------------
-# Email helpers
+# Email via Resend
 # -----------------------------
-def _smtp_ready() -> bool:
-    return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and FROM_EMAIL)
+def _resend_ready() -> bool:
+    return EMAIL_PROVIDER == "resend" and bool(RESEND_API_KEY) and bool(FROM_EMAIL)
 
 def send_email(to_email: str, subject: str, body: str) -> None:
-    if not _smtp_ready():
-        raise RuntimeError("SMTP not configured. Set SMTP_HOST/PORT/USER/PASS and FROM_EMAIL.")
+    """
+    Uses Resend HTTP API (works on Render even when SMTP egress is blocked).
+    """
+    if not _resend_ready():
+        raise RuntimeError("Resend not configured. Set EMAIL_PROVIDER=resend, RESEND_API_KEY, FROM_EMAIL.")
 
-    msg = EmailMessage()
-    msg["From"] = FROM_EMAIL
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
-
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "from": FROM_EMAIL,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+    }
+    r = httpx.post(url, headers=headers, json=payload, timeout=20)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Resend error {r.status_code}: {r.text}")
 
 def fmt_local(dt_utc: datetime, tz_str: str) -> str:
     dt_local = dt_utc.astimezone(ZoneInfo(tz_str))
@@ -514,7 +518,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             rem = {**rem, "due_datetime_local": forced}
         return rem
 
-    # Treat inconsistent LLM outputs as "both"
     if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
         result_type = "both"
     if result_type == "kb" and extraction.get("reminder") and extraction.get("kb_entry"):
@@ -560,6 +563,7 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             "status": "open",
             "source_message": body.message,
             "notes": rem_data.get("notes"),
+            "emailed_at": None,  # used by dispatcher
         }
         rows = await db.insert("reminders", rdata)
         saved = rows[0] if rows else rdata
@@ -573,7 +577,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
         return saved
 
-    # If LLM says clarify but server can parse a due datetime, create reminder anyway
     if result_type == "clarify":
         forced_due = _forced_due_from_server()
         if forced_due:
@@ -632,7 +635,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 async def get_messages(request: Request, limit: int = 200):
     db = get_db(request)
     uid = get_user_id(request)
-
     rows = await db.select(
         "chat_messages",
         {"user_id": f"eq.{uid}", "order": "created_at.desc", "limit": str(limit)},
@@ -680,29 +682,26 @@ async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request:
 @api_router.post("/dispatch-emails")
 async def dispatch_emails(request: Request):
     """
-    Called by cron every 5 minutes.
-    Requires X-Dispatch-Secret header to match DISPATCH_SECRET.
-
+    Security: requires X-Dispatch-Secret header to match DISPATCH_SECRET.
     Sends:
-      1) Due emails: once within [due - 2h, due + 2h]
-         If now > due + 2h: mark reminder status = missed
-      2) Daily summary: once/day per user at 08:00 local within a small window
+      1) Due emails within [due-2h, due+5m] for open reminders (once)
+      2) Daily summary at 08:00 local time (once/day/user)
     """
     secret = request.headers.get("X-Dispatch-Secret", "")
     if not DISPATCH_SECRET or secret != DISPATCH_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not _smtp_ready():
-        raise HTTPException(status_code=500, detail="SMTP not configured")
+    if not _resend_ready():
+        raise HTTPException(status_code=500, detail="Resend not configured")
 
     db = get_service_db()
     now_utc = datetime.now(timezone.utc)
 
     sent_due = 0
     sent_daily = 0
+    marked_missed = 0
     checked_reminders = 0
     checked_users = 0
-    marked_missed = 0
 
     users = await db.select(
         "user_profile",
@@ -743,16 +742,16 @@ async def dispatch_emails(request: Request):
             if not rid or not due_utc:
                 continue
 
-            window_start = due_utc - timedelta(hours=DUE_WINDOW_BEFORE_HOURS)
-            window_end = due_utc + timedelta(hours=DUE_WINDOW_AFTER_HOURS)
+            window_start = due_utc - timedelta(hours=DUE_EARLY_WINDOW_HOURS)
+            window_end = due_utc + timedelta(minutes=DUE_LATE_GRACE_MINUTES)
 
             if now_utc < window_start:
                 continue
 
             if now_utc > window_end:
-                # Stop re-checking forever
+                # Optional: mark as missed so it stops retrying forever
                 try:
-                    await db.update("reminders", {"status": "missed"}, {"id": rid})
+                    await db.update("reminders", {"status": "missed"}, {"id": rid, "user_id": user_id})
                     marked_missed += 1
                 except Exception:
                     logger.exception(f"Failed marking missed reminder_id={rid}")
@@ -771,7 +770,7 @@ async def dispatch_emails(request: Request):
 
             try:
                 send_email(user_email, subject, body)
-                await db.update("reminders", {"emailed_at": now_utc.isoformat()}, {"id": rid})
+                await db.update("reminders", {"emailed_at": now_utc.isoformat()}, {"id": rid, "user_id": user_id})
                 sent_due += 1
             except Exception:
                 logger.exception(f"Failed sending due email user_id={user_id} reminder_id={rid}")
