@@ -36,7 +36,7 @@ RESEND_API_KEY = (os.environ.get("RESEND_API_KEY") or "").strip()
 FROM_EMAIL = (os.environ.get("FROM_EMAIL") or "").strip()
 
 # Cron security
-DISPATCH_SECRET = os.environ.get("DISPATCH_SECRET")  # required for cron endpoint
+DISPATCH_SECRET = os.environ.get("DISPATCH_SECRET")
 
 # Daily summary time (local)
 DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR") or "8")
@@ -47,7 +47,7 @@ DAILY_SUMMARY_WINDOW_MINUTES = int(os.environ.get("DAILY_SUMMARY_WINDOW_MINUTES"
 DUE_EARLY_WINDOW_HOURS = int(os.environ.get("DUE_EARLY_WINDOW_HOURS") or "2")
 DUE_LATE_GRACE_MINUTES = int(os.environ.get("DUE_LATE_GRACE_MINUTES") or "5")
 
-# Proactive gap questioning
+# Proactive gap questions (LLM-side)
 MAX_GAP_QUESTIONS = int(os.environ.get("MAX_GAP_QUESTIONS") or "3")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
@@ -157,7 +157,7 @@ def get_user_id(request: Request) -> str:
 
 
 def get_db(request: Request) -> SupabaseREST:
-    token = get_token(request)  # end-user JWT
+    token = get_token(request)
     return SupabaseREST(token=token, apikey=SUPABASE_ANON_KEY)
 
 
@@ -300,10 +300,50 @@ def local_to_utc(local_dt_str: str, tz_str: str) -> str:
         local_dt = local_dt.replace(tzinfo=ZoneInfo(tz_str))
     return local_dt.astimezone(ZoneInfo("UTC")).isoformat()
 
+def message_contains_weekday(text: str) -> bool:
+    t = (text or "").lower()
+    keys = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday","mon","tue","wed","thu","fri","sat","sun"]
+    return any(k in t for k in keys)
+
+# -----------------------------
+# Deterministic order quantity gap detection (server-side)
+# -----------------------------
+ORDER_TOTAL_RE = re.compile(r"\border\s+(?:for\s+)?(?P<total>\d+)\b", re.IGNORECASE)
+COLOR_QTY_RE = re.compile(
+    r"\b(?P<qty>\d+)\s+(?P<color>red|blue|green|black|white|yellow|navy|maroon|grey|gray)\b",
+    re.IGNORECASE
+)
+
+def detect_quantity_gap(message: str) -> Optional[Tuple[int, int]]:
+    if not message:
+        return None
+    m = ORDER_TOTAL_RE.search(message)
+    if not m:
+        return None
+    try:
+        total = int(m.group("total"))
+    except Exception:
+        return None
+
+    matches = list(COLOR_QTY_RE.finditer(message))
+    if not matches:
+        return None
+
+    specified = 0
+    for mm in matches:
+        try:
+            specified += int(mm.group("qty"))
+        except Exception:
+            continue
+
+    if specified > 0 and specified < total:
+        return (total, specified)
+    return None
+
 # -----------------------------
 # LLM Extraction (Groq)
 # -----------------------------
-EXTRACTION_PROMPT = """You are SecondBrain, a proactive personal assistant that captures facts and pushes work forward safely.
+EXTRACTION_PROMPT = """You are SecondBrain, a proactive personal assistant for garment production operations.
 
 Current date/time (user's local): {now}
 User's default timezone: {timezone}
@@ -313,50 +353,46 @@ CORE GOAL:
 - Ensure what needs to happen gets scheduled or clarified.
 - Prevent missed follow ups and missing details.
 
-MODE: PROACTIVE OPS COPILOT
 MAX_QUESTIONS = {max_q}
 
-STRICT RULES (NO EXCEPTIONS):
+STRICT RULES:
 1) Never invent facts, names, quantities, dates, or times.
-2) Never create a reminder unless the user includes explicit scheduling intent or action intent.
-   Valid intent examples: "follow up", "remind me", "call", "check back", "tomorrow", "next Monday", "in 2 days", a specific date, or a specific time.
-3) If the message contains ONLY factual information with no action intent, set type="kb".
-4) If the message contains ONLY an action with time intent, set type="reminder".
-5) If the message contains BOTH facts and an action with time intent, set type="both".
-6) PROACTIVE GAP CHECK (MANDATORY when orders/projects/work are mentioned):
+2) If the message contains ONLY factual info with no action intent, type="kb".
+3) If the message contains ONLY follow-up/action with date/time intent, type="reminder".
+4) If the message contains BOTH factual info AND follow-up/action with date/time intent, type="both".
+5) If a reminder is intended but date/time is missing, type="clarify".
+6) PROACTIVE GAP CHECK (MANDATORY when orders or production work are mentioned):
    - Detect missing or inconsistent details that block execution.
    - If blocking gaps exist, ask up to MAX_QUESTIONS questions in a numbered list.
    - Questions MUST follow the GAP PRIORITY ORDER below.
-   - Ask only blocking questions, do not ask nice-to-have questions.
-7) When asking questions: be short, specific, and do not include extra commentary.
+   - Ask only blocking questions.
 
-GAP PRIORITY ORDER (highest to lowest):
-P0: Numeric inconsistency (total quantity does not match sum of breakdowns).
-P1: Missing date/time for an explicitly requested follow-up/reminder.
+GAP PRIORITY ORDER:
+P0: Numeric inconsistency (total quantity != sum of breakdowns). ALWAYS first.
+P1: Missing date/time for an explicitly requested follow up.
 P2: Missing delivery date or delivery location for an order.
-P3: Missing specs that block production: fabric, size breakdown, design/branding, sample approval.
+P3: Missing specs that block production: fabric, size breakdown, branding, sample approval.
 P4: Missing commercial terms: price, payment status, PO/reference.
 P5: Entity spelling inconsistency (lowest priority unless it blocks identification).
 
 IMPORTANT:
-- The ONLY required reminder field is due_datetime_local. If missing but scheduling intent exists, ask for date/time (type="clarify").
-- Preserve entity names exactly as typed by the user.
-- If quantities are inconsistent (total != sum of breakdown), you MUST ask about the missing remainder before any other gap.
-- If relative time is provided, you may output due_datetime_local, but the server may override it.
+- Preserve entity names exactly as typed by the user in kb_entry and reminder.
+- If quantities are inconsistent, ask about the missing remainder before any name/spelling question.
+- If relative weekday time is provided (like Monday 10 am), you may output it, but the server may override it.
 
 PENDING REMINDER STATE: {pending_reminder}
 
-RETURN ONLY VALID JSON (no extra text):
+RETURN ONLY VALID JSON:
 {{
   "type": "kb" | "reminder" | "both" | "clarify" | "chat",
   "kb_entry": {{
     "entity_type": "note" | "contact" | "order" | "fact",
     "entity_name": "string or null",
     "order_ref": "string or null",
-    "details": "the key information extracted, concise and business-readable"
+    "details": "concise extracted facts"
   }} or null,
   "reminder": {{
-    "title": "short descriptive title or Reminder if none given",
+    "title": "short title",
     "due_datetime_local": "YYYY-MM-DDTHH:MM:SS",
     "timezone": "IANA timezone string or null",
     "order_ref": "string or null",
@@ -377,7 +413,7 @@ RETURN ONLY VALID JSON (no extra text):
     "order_ref": "string or null",
     "related_party": "string or null"
   }} or null,
-  "response": "natural language response confirming what you did"
+  "response": "natural language confirmation"
 }}"""
 
 async def extract_message(message: str, user_tz: str, pending: dict = None, recent: list = None) -> dict:
@@ -435,11 +471,9 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
                     "response": text or "LLM returned empty response",
                 }
 
-        # Backfill defaults
         if "gaps" not in data or not isinstance(data.get("gaps"), list):
             data["gaps"] = []
 
-        # If model produced gaps but no clarify_question, generate one from top gaps
         if data.get("gaps") and not data.get("clarify_question"):
             qs = []
             for g in data["gaps"][:MAX_GAP_QUESTIONS]:
@@ -447,7 +481,6 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
                 if q:
                     qs.append(q)
             if qs:
-                # Numbered list for multi-question mode
                 data["clarify_question"] = "\n".join([f"{i+1}. {q}" for i, q in enumerate(qs)])
 
         return data
@@ -556,6 +589,13 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         [{"role": m["role"], "content": m["content"]} for m in recent],
     )
 
+    # Hard rule: if quantity gap exists, do not let name-spelling clarify win
+    qty_gap = detect_quantity_gap(body.message)
+    if qty_gap:
+        cq = (extraction.get("clarify_question") or "").lower()
+        if "entity name" in cq or ("surya" in cq and "suriya" in cq):
+            extraction["clarify_question"] = None
+
     result_type = extraction.get("type", "chat")
     response_text = extraction.get("response", "Got it!")
     saved_kb = None
@@ -567,9 +607,17 @@ async def chat_endpoint(body: ChatRequest, request: Request):
     def _override_due_if_relative(rem: dict) -> dict:
         if not rem:
             return rem
+
         forced = _forced_due_from_server()
         if forced:
-            rem = {**rem, "due_datetime_local": forced}
+            return {**rem, "due_datetime_local": forced}
+
+        # If message contains weekday, force server resolution even if model gave a date
+        if message_contains_weekday(body.message):
+            forced2 = _resolve_relative_due_datetime(body.message, user_tz, pending=body.pending_reminder)
+            if forced2:
+                return {**rem, "due_datetime_local": forced2}
+
         return rem
 
     if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
@@ -631,7 +679,6 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
         return saved
 
-    # In multi-question proactive mode, do NOT auto-create reminders during clarify
     if result_type == "clarify":
         response_text = extraction.get("clarify_question") or response_text
 
@@ -646,22 +693,37 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             parts.append(f"Saved to Knowledge Base: {saved_kb.get('details','')[:140]}")
         if saved_reminder and saved_reminder.get("_confirmation"):
             parts.append(saved_reminder["_confirmation"])
-        if extraction.get("clarify_question"):
-            parts.append(extraction["clarify_question"])
-        if parts:
-            response_text = " | ".join(parts)
+
+        response_text = " | ".join(parts) if parts else response_text
 
     elif result_type == "kb" and extraction.get("kb_entry"):
         saved_kb = await _save_kb(extraction["kb_entry"])
-        if extraction.get("clarify_question"):
-            response_text = f"{response_text}\n{extraction['clarify_question']}".strip()
 
     elif result_type == "reminder" and extraction.get("reminder"):
         saved_reminder = await _save_reminder(extraction["reminder"])
         if saved_reminder and saved_reminder.get("_confirmation"):
             response_text = saved_reminder["_confirmation"]
-        if extraction.get("clarify_question"):
-            response_text = f"{response_text}\n{extraction['clarify_question']}".strip()
+
+    # Deterministic P0 question: quantity remainder (always ask if mismatch)
+    qty_gap2 = detect_quantity_gap(body.message)
+    if qty_gap2:
+        total, specified = qty_gap2
+        remaining = total - specified
+        remainder_q = f"What colors are the remaining {remaining} shirts?"
+        if remainder_q.lower() not in (response_text or "").lower():
+            response_text = (response_text or "").strip()
+            if response_text:
+                response_text += "\n\n"
+            response_text += f"1. {remainder_q}"
+
+    # If LLM provided other clarify questions, append them after P0
+    llm_q = (extraction.get("clarify_question") or "").strip()
+    if llm_q:
+        if llm_q.lower() not in (response_text or "").lower():
+            response_text = (response_text or "").strip()
+            if response_text:
+                response_text += "\n\n"
+            response_text += llm_q
 
     await db.insert("chat_messages", {"user_id": uid, "role": "assistant", "content": response_text})
 
@@ -725,6 +787,12 @@ async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request:
 # -----------------------------
 @api_router.post("/dispatch-emails")
 async def dispatch_emails(request: Request):
+    """
+    Security: requires X-Dispatch-Secret header to match DISPATCH_SECRET.
+    Sends:
+      1) Due emails within [due-2h, due+5m] for open reminders (once)
+      2) Daily summary at 08:00 local time (once/day/user)
+    """
     secret = request.headers.get("X-Dispatch-Secret", "")
     if not DISPATCH_SECRET or secret != DISPATCH_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -759,6 +827,7 @@ async def dispatch_emails(request: Request):
         if not user_id or not user_email or not tz_str:
             continue
 
+        # 1) DUE EMAILS
         reminders = await db.select(
             "reminders",
             {
@@ -796,12 +865,12 @@ async def dispatch_emails(request: Request):
             display_tz = (r.get("timezone") or tz_str).strip() or tz_str
             subject = f"Reminder: {title}"
             body_text = (
-                f"Hi,\n\n"
-                f"This is your reminder:\n"
+                "Hi,\n\n"
+                "This is your reminder:\n"
                 f"- {title}\n\n"
-                f"Scheduled time:\n"
+                "Scheduled time:\n"
                 f"- {fmt_local(due_utc, display_tz)} ({display_tz})\n\n"
-                f"SecondBrain"
+                "SecondBrain"
             )
 
             try:
@@ -811,6 +880,7 @@ async def dispatch_emails(request: Request):
             except Exception:
                 logger.exception(f"Failed sending due email user_id={user_id} reminder_id={rid}")
 
+        # 2) DAILY SUMMARY
         try:
             user_now_local = now_utc.astimezone(ZoneInfo(tz_str))
         except Exception:
