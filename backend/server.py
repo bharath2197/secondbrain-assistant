@@ -25,7 +25,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()  # strip whitespace/newlines
+GROQ_MODEL = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
 
 # Email dispatch env
 SMTP_HOST = os.environ.get("SMTP_HOST")
@@ -40,9 +40,9 @@ DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR") or "8")
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE") or "0")
 DAILY_SUMMARY_WINDOW_MINUTES = int(os.environ.get("DAILY_SUMMARY_WINDOW_MINUTES") or "5")
 
-# Due send window
-DUE_EARLY_WINDOW_HOURS = int(os.environ.get("DUE_EARLY_WINDOW_HOURS") or "2")
-DUE_LATE_GRACE_MINUTES = int(os.environ.get("DUE_LATE_GRACE_MINUTES") or "5")
+# Due send window: send ONCE within [-2h, +2h]
+DUE_WINDOW_BEFORE_HOURS = int(os.environ.get("DUE_WINDOW_BEFORE_HOURS") or "2")
+DUE_WINDOW_AFTER_HOURS = int(os.environ.get("DUE_WINDOW_AFTER_HOURS") or "2")
 
 if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_ANON_KEY env vars")
@@ -67,10 +67,16 @@ if GROQ_API_KEY:
 # Supabase REST helpers
 # -----------------------------
 class SupabaseREST:
-    def __init__(self, token: str):
+    """
+    IMPORTANT FIX:
+    apikey header must match the token you use (anon vs service role),
+    otherwise you can get weird auth/RLS behavior.
+    """
+    def __init__(self, token: str, apikey: Optional[str] = None):
         self.base = f"{SUPABASE_URL}/rest/v1"
+        key = apikey or SUPABASE_ANON_KEY
         self.headers = {
-            "apikey": SUPABASE_ANON_KEY,
+            "apikey": key,
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
@@ -145,18 +151,14 @@ def get_user_id(request: Request) -> str:
 
 
 def get_db(request: Request) -> SupabaseREST:
-    return SupabaseREST(get_token(request))
+    # End-user requests: anon apikey + user's JWT as Bearer
+    return SupabaseREST(get_token(request), apikey=SUPABASE_ANON_KEY)
 
-# -----------------------------
-# Service-role Supabase client for cron job
-# -----------------------------
+
 def get_service_db() -> SupabaseREST:
-    """
-    For cron job: use service role key if available, otherwise anon.
-    This endpoint should not rely on end-user JWT.
-    """
+    # Cron job: service role key for both apikey + Bearer token
     service_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or SUPABASE_ANON_KEY
-    return SupabaseREST(service_key)
+    return SupabaseREST(service_key, apikey=service_key)
 
 # -----------------------------
 # Request models
@@ -177,31 +179,19 @@ class ReminderStatusUpdate(BaseModel):
 # Date parsing (server-side)
 # -----------------------------
 WEEKDAYS = {
-    "monday": 0,
-    "mon": 0,
-    "tuesday": 1,
-    "tue": 1,
-    "tues": 1,
-    "wednesday": 2,
-    "wed": 2,
-    "thursday": 3,
-    "thu": 3,
-    "thur": 3,
-    "thurs": 3,
-    "friday": 4,
-    "fri": 4,
-    "saturday": 5,
-    "sat": 5,
-    "sunday": 6,
-    "sun": 6,
+    "monday": 0, "mon": 0,
+    "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5,
+    "sunday": 6, "sun": 6,
 }
 
-# Bug fix 1: strict time parsing.
-# Only parse explicit times:
-# - 12h requires am/pm: "3pm", "3 pm", "3:30pm"
-# - 24h requires colon: "15:30"
-# Never parse naked numbers like "2" in "2 weeks".
-TIME_12H_STRICT_RE = re.compile(r"\b(?P<h>1[0-2]|0?[1-9])(?::(?P<m>[0-5]\d))?\s*(?P<ampm>am|pm)\b", re.IGNORECASE)
+TIME_12H_STRICT_RE = re.compile(
+    r"\b(?P<h>1[0-2]|0?[1-9])(?::(?P<m>[0-5]\d))?\s*(?P<ampm>am|pm)\b",
+    re.IGNORECASE
+)
 TIME_24H_STRICT_RE = re.compile(r"\b(?P<h>[01]?\d|2[0-3]):(?P<m>[0-5]\d)\b")
 
 IN_WEEKS_RE = re.compile(r"\bin\s+(?P<n>\d+)\s+weeks?\b", re.IGNORECASE)
@@ -215,9 +205,7 @@ THIS_NEXT_DOW_RE = re.compile(
 def _parse_time_from_text_strict(text: str) -> Optional[Tuple[int, int]]:
     m24 = TIME_24H_STRICT_RE.search(text)
     if m24:
-        h = int(m24.group("h"))
-        minute = int(m24.group("m"))
-        return (h, minute)
+        return (int(m24.group("h")), int(m24.group("m")))
 
     m12 = TIME_12H_STRICT_RE.search(text)
     if not m12:
@@ -428,10 +416,6 @@ def _smtp_ready() -> bool:
     return bool(SMTP_HOST and SMTP_PORT and SMTP_USER and SMTP_PASS and FROM_EMAIL)
 
 def send_email(to_email: str, subject: str, body: str) -> None:
-    """
-    Free beta approach: Gmail SMTP with App Password.
-    Raises on failure. Caller controls retries and DB updates.
-    """
     if not _smtp_ready():
         raise RuntimeError("SMTP not configured. Set SMTP_HOST/PORT/USER/PASS and FROM_EMAIL.")
 
@@ -458,7 +442,6 @@ def _parse_supabase_timestamptz(value: Any) -> Optional[datetime]:
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     s = str(value).strip()
     try:
-        # Supabase tends to return "YYYY-MM-DD HH:MM:SS+00"
         s = s.replace(" ", "T")
         dt = datetime.fromisoformat(s)
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -531,6 +514,7 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             rem = {**rem, "due_datetime_local": forced}
         return rem
 
+    # Treat inconsistent LLM outputs as "both"
     if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
         result_type = "both"
     if result_type == "kb" and extraction.get("reminder") and extraction.get("kb_entry"):
@@ -589,6 +573,7 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
         return saved
 
+    # If LLM says clarify but server can parse a due datetime, create reminder anyway
     if result_type == "clarify":
         forced_due = _forced_due_from_server()
         if forced_due:
@@ -695,11 +680,13 @@ async def update_reminder(reminder_id: str, body: ReminderStatusUpdate, request:
 @api_router.post("/dispatch-emails")
 async def dispatch_emails(request: Request):
     """
-    Called by Render Cron Job every 5 minutes.
-    Security: requires X-Dispatch-Secret header to match DISPATCH_SECRET.
+    Called by cron every 5 minutes.
+    Requires X-Dispatch-Secret header to match DISPATCH_SECRET.
+
     Sends:
-      1) Due emails within [due-2h, due+5m] for open reminders (once)
-      2) Daily summary at 08:00 local time (once per day per user)
+      1) Due emails: once within [due - 2h, due + 2h]
+         If now > due + 2h: mark reminder status = missed
+      2) Daily summary: once/day per user at 08:00 local within a small window
     """
     secret = request.headers.get("X-Dispatch-Secret", "")
     if not DISPATCH_SECRET or secret != DISPATCH_SECRET:
@@ -715,9 +702,8 @@ async def dispatch_emails(request: Request):
     sent_daily = 0
     checked_reminders = 0
     checked_users = 0
+    marked_missed = 0
 
-    # Fetch users (id, user_email, timezone, last_daily_email_at)
-    # NOTE: your user_profile table columns include id, user_email, timezone, and we add last_daily_email_at.
     users = await db.select(
         "user_profile",
         {
@@ -736,15 +722,14 @@ async def dispatch_emails(request: Request):
         if not user_id or not user_email or not tz_str:
             continue
 
-        # 1) DUE EMAILS for this user
-        # Fetch open reminders not yet emailed due (limit to keep runs bounded)
+        # 1) DUE EMAILS
         reminders = await db.select(
             "reminders",
             {
-                "select": "id,title,due_datetime,timezone,status,emailed_due_at",
+                "select": "id,title,due_datetime,timezone,status,emailed_at",
                 "user_id": f"eq.{user_id}",
                 "status": "eq.open",
-                "emailed_due_at": "is.null",
+                "emailed_at": "is.null",
                 "order": "due_datetime.asc",
                 "limit": "200",
             },
@@ -758,18 +743,21 @@ async def dispatch_emails(request: Request):
             if not rid or not due_utc:
                 continue
 
-            window_start = due_utc - timedelta(hours=DUE_EARLY_WINDOW_HOURS)
-            window_end = due_utc + timedelta(minutes=DUE_LATE_GRACE_MINUTES)
+            window_start = due_utc - timedelta(hours=DUE_WINDOW_BEFORE_HOURS)
+            window_end = due_utc + timedelta(hours=DUE_WINDOW_AFTER_HOURS)
 
-            # Outside allowed send window
             if now_utc < window_start:
                 continue
+
             if now_utc > window_end:
-                # Bug-proof behavior: skip late reminders permanently by NOT sending
-                # We leave emailed_due_at null so you can inspect them later.
+                # Stop re-checking forever
+                try:
+                    await db.update("reminders", {"status": "missed"}, {"id": rid})
+                    marked_missed += 1
+                except Exception:
+                    logger.exception(f"Failed marking missed reminder_id={rid}")
                 continue
 
-            # Send email and then mark emailed_due_at (idempotent)
             display_tz = (r.get("timezone") or tz_str).strip() or tz_str
             subject = f"Reminder: {title}"
             body = (
@@ -780,21 +768,20 @@ async def dispatch_emails(request: Request):
                 f"- {fmt_local(due_utc, display_tz)} ({display_tz})\n\n"
                 f"SecondBrain"
             )
+
             try:
                 send_email(user_email, subject, body)
-                await db.update("reminders", {"emailed_due_at": now_utc.isoformat()}, {"id": rid})
+                await db.update("reminders", {"emailed_at": now_utc.isoformat()}, {"id": rid})
                 sent_due += 1
             except Exception:
                 logger.exception(f"Failed sending due email user_id={user_id} reminder_id={rid}")
-                # Do not set emailed_due_at on failure
 
-        # 2) DAILY SUMMARY at 08:00 local (once/day)
+        # 2) DAILY SUMMARY
         try:
             user_now_local = now_utc.astimezone(ZoneInfo(tz_str))
         except Exception:
             continue
 
-        # Only run summary inside a small window after 08:00
         summary_start = user_now_local.replace(
             hour=DAILY_SUMMARY_HOUR,
             minute=DAILY_SUMMARY_MINUTE,
@@ -812,29 +799,11 @@ async def dispatch_emails(request: Request):
             if last_local_date == user_now_local.date():
                 continue
 
-        # Build today's UTC range based on user's local date
         start_of_day_local = user_now_local.replace(hour=0, minute=0, second=0, microsecond=0)
         start_of_next_day_local = start_of_day_local + timedelta(days=1)
         start_utc = start_of_day_local.astimezone(timezone.utc)
         end_utc = start_of_next_day_local.astimezone(timezone.utc)
 
-        todays = await db.select(
-            "reminders",
-            {
-                "select": "title,due_datetime,timezone,status",
-                "user_id": f"eq.{user_id}",
-                "status": "eq.open",
-                "due_datetime": f"gte.{start_utc.isoformat()}",
-                "due_datetime": f"lt.{end_utc.isoformat()}",
-                "order": "due_datetime.asc",
-                "limit": "200",
-            },
-        )
-        # NOTE: Supabase REST cannot accept duplicate keys in dict. So we do OR via manual query below if needed.
-        # Workaround: fetch broader range by day using 'and' style is tricky in dict.
-        # We'll instead fetch open reminders and filter in code for correctness.
-
-        # Re-fetch open reminders and filter locally to avoid duplicate query param keys issue.
         open_all = await db.select(
             "reminders",
             {
@@ -885,6 +854,7 @@ async def dispatch_emails(request: Request):
         "ok": True,
         "sent_due": sent_due,
         "sent_daily": sent_daily,
+        "marked_missed": marked_missed,
         "checked_users": checked_users,
         "checked_reminders": checked_reminders,
         "now_utc": now_utc.isoformat(),
