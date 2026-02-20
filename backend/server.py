@@ -42,7 +42,7 @@ DAILY_SUMMARY_HOUR = int(os.environ.get("DAILY_SUMMARY_HOUR") or "8")
 DAILY_SUMMARY_MINUTE = int(os.environ.get("DAILY_SUMMARY_MINUTE") or "0")
 DAILY_SUMMARY_WINDOW_MINUTES = int(os.environ.get("DAILY_SUMMARY_WINDOW_MINUTES") or "5")
 
-# Due send window (recommended for cron every 5 min)
+# Due send window (cron every 5 min)
 DUE_EARLY_WINDOW_HOURS = int(os.environ.get("DUE_EARLY_WINDOW_HOURS") or "2")
 DUE_LATE_GRACE_MINUTES = int(os.environ.get("DUE_LATE_GRACE_MINUTES") or "5")
 
@@ -202,6 +202,15 @@ THIS_NEXT_DOW_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Heuristic: explicit scheduling intent keywords
+SCHED_INTENT_RE = re.compile(
+    r"\b(remind|reminder|follow\s*up|call|email|text|ping|check\s*back|schedule|meet|meeting|tomorrow|today|tonight|next|this\s+(mon|tue|wed|thu|fri|sat|sun)|in\s+\d+\s+(day|days|week|weeks)|\d{1,2}(:\d{2})?\s*(am|pm)|\d{1,2}:\d{2})\b",
+    re.IGNORECASE,
+)
+
+def has_scheduling_intent(text: str) -> bool:
+    return bool(SCHED_INTENT_RE.search(text or ""))
+
 def _parse_time_from_text_strict(text: str) -> Optional[Tuple[int, int]]:
     m24 = TIME_24H_STRICT_RE.search(text)
     if m24:
@@ -299,32 +308,46 @@ def local_to_utc(local_dt_str: str, tz_str: str) -> str:
 # -----------------------------
 # LLM Extraction (Groq)
 # -----------------------------
-EXTRACTION_PROMPT = """You are SecondBrain, a personal assistant. Process the user's message and determine the appropriate action.
+EXTRACTION_PROMPT = """You are SecondBrain, a proactive personal assistant that captures facts and pushes work forward safely.
 
 Current date/time (user's local): {now}
 User's default timezone: {timezone}
 
-RULES:
-1. If the message contains ONLY factual information (a fact, note, contact info, order details, preferences) with NO date/time/follow-up intent, classify as "kb".
-2. If the message mentions ONLY a future action, deadline, or follow-up with date/time intent, classify as "reminder".
-3. If the message contains BOTH factual information AND a follow-up/action with date/time intent, you MUST classify as "both" and fill BOTH kb_entry AND reminder.
-4. If a reminder is being built (see PENDING STATE) but required fields are still missing after considering this message, classify as "clarify" and ask exactly ONE specific question for the missing field.
-5. For general conversation or greetings, classify as "chat".
+CORE GOAL:
+- Store what happened in the knowledge base.
+- Ensure what needs to happen gets scheduled or clarified.
+- Prevent missed follow ups and missing details.
+
+STRICT RULES (NO EXCEPTIONS):
+1) Never invent facts, names, quantities, dates, or times.
+2) Never create a reminder unless the user includes explicit scheduling intent or action intent.
+   Examples of valid intent: "follow up", "remind me", "call", "check back", "tomorrow", "next Monday", "in 2 days", a specific date, or a specific time.
+3) If the message contains ONLY factual information with no action intent, set type="kb".
+4) If the message contains ONLY an action with time intent, set type="reminder".
+5) If the message contains BOTH facts and an action with time intent, set type="both".
+6) PROACTIVE GAP CHECK (MANDATORY when orders/projects are mentioned):
+   - Detect missing or inconsistent details that block execution.
+   - If a blocking gap exists, set type="clarify" and ask exactly ONE highest priority question.
+   - Highest priority means: the one missing detail that prevents next action or creates risk.
+   - Examples of gaps: totals do not match breakdown, missing fabric, missing delivery date, sample approval unclear, payment status unclear, inconsistent party spelling (Surya vs Suriya).
+7) When asking a question, ask exactly ONE question, clear and specific. No extra questions.
 
 IMPORTANT:
-- If the user gives relative time like "next Friday at 3pm" or "in 2 weeks", you may set due_datetime_local, BUT the server may override it.
-- The ONLY required reminder field is due_datetime_local. If missing, return type "clarify" and ask for date/time.
+- The ONLY required reminder field is due_datetime_local. If missing but scheduling intent exists, ask for date/time (type="clarify").
+- Preserve entity names exactly as typed by the user. If you see multiple spellings for the same party, treat it as a gap and ask which is correct.
+- If quantities are inconsistent (total != sum of breakdown), treat it as a gap and ask for clarification.
+- If relative time is provided, you may output due_datetime_local, but the server may override it.
 
 PENDING REMINDER STATE: {pending_reminder}
 
-RETURN ONLY VALID JSON:
+RETURN ONLY VALID JSON (no extra text):
 {{
   "type": "kb" | "reminder" | "both" | "clarify" | "chat",
   "kb_entry": {{
     "entity_type": "note" | "contact" | "order" | "fact",
     "entity_name": "string or null",
     "order_ref": "string or null",
-    "details": "the key information extracted"
+    "details": "the key information extracted, concise and business-readable"
   }} or null,
   "reminder": {{
     "title": "short descriptive title or Reminder if none given",
@@ -333,6 +356,18 @@ RETURN ONLY VALID JSON:
     "order_ref": "string or null",
     "related_party": "string or null"
   }} or null,
+  "gaps": [
+    {{
+      "field": "string",
+      "issue": "string",
+      "question": "string"
+    }}
+  ],
+  "next_best_action": {{
+    "action": "none" | "create_kb_only" | "create_reminder" | "suggest_reminder" | "clarify",
+    "details": "string"
+  }} or null,
+  "confidence": 0.0,
   "clarify_question": "string or null",
   "updated_pending": {{
     "title": "string or null",
@@ -356,6 +391,9 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
             "type": "chat",
             "kb_entry": None,
             "reminder": None,
+            "gaps": [],
+            "next_best_action": {"action": "none", "details": "LLM not configured."},
+            "confidence": 0.0,
             "clarify_question": None,
             "updated_pending": None,
             "response": "LLM not configured.",
@@ -380,28 +418,40 @@ async def extract_message(message: str, user_tz: str, pending: dict = None, rece
         )
         text = (resp.choices[0].message.content or "").strip()
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except json.JSONDecodeError:
             m = re.search(r"\{[\s\S]*\}", text)
             if m:
-                try:
-                    return json.loads(m.group())
-                except json.JSONDecodeError:
-                    pass
-            return {
-                "type": "chat",
-                "kb_entry": None,
-                "reminder": None,
-                "clarify_question": None,
-                "updated_pending": None,
-                "response": text or "LLM returned empty response",
-            }
+                data = json.loads(m.group())
+            else:
+                data = {
+                    "type": "chat",
+                    "kb_entry": None,
+                    "reminder": None,
+                    "clarify_question": None,
+                    "updated_pending": None,
+                    "response": text or "LLM returned empty response",
+                }
+
+        # Backfill defaults for proactive fields
+        if "gaps" not in data or not isinstance(data.get("gaps"), list):
+            data["gaps"] = []
+        if "next_best_action" not in data:
+            data["next_best_action"] = None
+        if "confidence" not in data:
+            data["confidence"] = 0.0
+
+        return data
+
     except Exception:
         logger.exception("Groq call failed")
         return {
             "type": "chat",
             "kb_entry": None,
             "reminder": None,
+            "gaps": [],
+            "next_best_action": {"action": "none", "details": "LLM failed."},
+            "confidence": 0.0,
             "clarify_question": None,
             "updated_pending": None,
             "response": "LLM failed. Please try again.",
@@ -518,6 +568,7 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             rem = {**rem, "due_datetime_local": forced}
         return rem
 
+    # Normalize type if model returns inconsistent payload
     if result_type == "reminder" and extraction.get("kb_entry") and extraction.get("reminder"):
         result_type = "both"
     if result_type == "kb" and extraction.get("reminder") and extraction.get("kb_entry"):
@@ -563,7 +614,7 @@ async def chat_endpoint(body: ChatRequest, request: Request):
             "status": "open",
             "source_message": body.message,
             "notes": rem_data.get("notes"),
-            "emailed_at": None,  # used by dispatcher
+            "emailed_at": None,
         }
         rows = await db.insert("reminders", rdata)
         saved = rows[0] if rows else rdata
@@ -577,9 +628,16 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
         return saved
 
+    # PROACTIVE CLARIFY: do not auto-create reminders for non-time gaps.
+    # Only auto-fill due_datetime_local if the clarify is about missing date/time and the message shows scheduling intent.
     if result_type == "clarify":
+        clarify_q = (extraction.get("clarify_question") or "").lower()
+        looks_like_time_missing = ("date" in clarify_q) or ("time" in clarify_q) or ("when" in clarify_q)
+
         forced_due = _forced_due_from_server()
-        if forced_due:
+        intent = has_scheduling_intent(body.message)
+
+        if looks_like_time_missing and forced_due and intent:
             base_rem = extraction.get("reminder") or {}
             if not isinstance(base_rem, dict):
                 base_rem = {}
@@ -606,19 +664,32 @@ async def chat_endpoint(body: ChatRequest, request: Request):
 
         parts = []
         if saved_kb:
-            parts.append(f"Saved to Knowledge Base: {saved_kb.get('details','')[:80]}")
+            parts.append(f"Saved to Knowledge Base: {saved_kb.get('details','')[:120]}")
         if saved_reminder and saved_reminder.get("_confirmation"):
             parts.append(saved_reminder["_confirmation"])
+
+        # If gaps exist and model asked a clarify question, append it
+        if extraction.get("gaps") and extraction.get("clarify_question"):
+            parts.append(extraction["clarify_question"])
+
         if parts:
             response_text = " | ".join(parts)
 
     elif result_type == "kb" and extraction.get("kb_entry"):
         saved_kb = await _save_kb(extraction["kb_entry"])
 
+        # If proactive gaps exist, ask the one question
+        if extraction.get("gaps") and extraction.get("clarify_question"):
+            response_text = f"{response_text} {extraction['clarify_question']}".strip()
+
     elif result_type == "reminder" and extraction.get("reminder"):
         saved_reminder = await _save_reminder(extraction["reminder"])
         if saved_reminder and saved_reminder.get("_confirmation"):
             response_text = saved_reminder["_confirmation"]
+
+        # If proactive gaps exist, ask the one question
+        if extraction.get("gaps") and extraction.get("clarify_question"):
+            response_text = f"{response_text} {extraction['clarify_question']}".strip()
 
     await db.insert("chat_messages", {"user_id": uid, "role": "assistant", "content": response_text})
 
@@ -629,6 +700,9 @@ async def chat_endpoint(body: ChatRequest, request: Request):
         "reminder": saved_reminder,
         "clarify_question": extraction.get("clarify_question"),
         "updated_pending": extraction.get("updated_pending"),
+        "gaps": extraction.get("gaps", []),
+        "next_best_action": extraction.get("next_best_action"),
+        "confidence": extraction.get("confidence", 0.0),
     }
 
 @api_router.get("/messages")
@@ -721,7 +795,6 @@ async def dispatch_emails(request: Request):
         if not user_id or not user_email or not tz_str:
             continue
 
-        # 1) DUE EMAILS
         reminders = await db.select(
             "reminders",
             {
@@ -749,7 +822,6 @@ async def dispatch_emails(request: Request):
                 continue
 
             if now_utc > window_end:
-                # Optional: mark as missed so it stops retrying forever
                 try:
                     await db.update("reminders", {"status": "missed"}, {"id": rid, "user_id": user_id})
                     marked_missed += 1
@@ -759,7 +831,7 @@ async def dispatch_emails(request: Request):
 
             display_tz = (r.get("timezone") or tz_str).strip() or tz_str
             subject = f"Reminder: {title}"
-            body = (
+            body_text = (
                 f"Hi,\n\n"
                 f"This is your reminder:\n"
                 f"- {title}\n\n"
@@ -769,13 +841,13 @@ async def dispatch_emails(request: Request):
             )
 
             try:
-                send_email(user_email, subject, body)
+                send_email(user_email, subject, body_text)
                 await db.update("reminders", {"emailed_at": now_utc.isoformat()}, {"id": rid, "user_id": user_id})
                 sent_due += 1
             except Exception:
                 logger.exception(f"Failed sending due email user_id={user_id} reminder_id={rid}")
 
-        # 2) DAILY SUMMARY
+        # DAILY SUMMARY
         try:
             user_now_local = now_utc.astimezone(ZoneInfo(tz_str))
         except Exception:
